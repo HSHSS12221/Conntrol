@@ -1,0 +1,13 @@
+{
+  "name": "hsh-sovereign-soul-admin",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Gold and black HSH SovereignSoul admin console backed by Supabase",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.4",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0"
+  }
+}
