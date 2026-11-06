@@ -52,6 +52,29 @@ app.post('/launcher/commands/:id/ack', async (req, res, next) => {
   if (!verifyLauncherClient(clientId, req.headers.authorization)) return res.status(401).json({ error: 'Unauthorized' });
   try { const { error } = await supabase.from('launcher_command_deliveries').upsert({ command_id: req.params.id, client_id: clientId }, { onConflict: 'command_id,client_id' }); if (error) throw error; res.json({ received: true }); } catch (e) { next(e); }
 });
+// Launcher data export. Treat game data in this response as visible to launcher users; credentials stay private.
+app.get('/launcher/bootstrap', async (req, res, next) => {
+  if (!supabase) return res.status(503).json({ error: 'Supabase is not configured' });
+  const clientId = String(req.query.client_id || '').trim();
+  if (!clientId || clientId.length > 100) return res.status(400).json({ error: 'client_id is required' });
+  if (!verifyLauncherClient(clientId, req.headers.authorization)) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const serverInfoCollectionId = await coreCollectionId('serverinfo');
+    const [serverRows, playerRows] = await Promise.all([
+      fetchAllRows(() => supabase.from('admin_documents').select('data').eq('collection_id', serverInfoCollectionId).order('created_at')),
+      fetchAllRows(() => supabase.from('whitelists').select('*').order('created_at'))
+    ]);
+    const base = (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
+    const players = playerRows.map(({ auth, session_token, notes, ...player }) => player);
+    res.set('Cache-Control', 'no-store').json({
+      updated_at: new Date().toISOString(),
+      host: base,
+      urls: { serverinfo: `${base}/public/servers`, whitelist: `${base}/public/whitelist` },
+      serverinfo: serverRows.map(row => row.data),
+      players
+    });
+  } catch (e) { next(e); }
+});
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 app.get('/api/whitelists', async (req, res, next) => { try { res.json(await db.collection('whitelists').find({}, { orderBy: 'updated_at' })); } catch (e) { next(e); } });
 app.post('/api/whitelists', async (req, res, next) => { try { res.status(201).json(await db.collection('whitelists').insertOne(cleanWhitelist(req.body))); } catch (e) { next(e); } });
@@ -101,6 +124,7 @@ function cleanServer(x = {}) { return { room_name: String(x.room_name || '').tri
 function safeName(value) { const name = String(value || '').trim(); if (!/^[a-zA-Z][a-zA-Z0-9_-]{1,39}$/.test(name)) throw new Error('ใช้ชื่อ 2-40 ตัวอักษร เริ่มด้วย a-z และใช้ได้เฉพาะตัวเลข _ -'); return name; }
 function signLauncherClient(clientId) { return crypto.createHmac('sha256', LAUNCHER_TOKEN).update(`launcher-client-v1:${clientId}`).digest('hex'); }
 function verifyLauncherClient(clientId, authorization) { if (!LAUNCHER_TOKEN || !authorization?.startsWith('Bearer ')) return false; const supplied = Buffer.from(authorization.slice(7), 'hex'); const expected = Buffer.from(signLauncherClient(clientId), 'hex'); return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected); }
+async function fetchAllRows(buildQuery, pageSize = 1000) { const rows = []; for (let offset = 0; ; offset += pageSize) { const { data, error } = await buildQuery().range(offset, offset + pageSize - 1); if (error) throw error; rows.push(...data); if (data.length < pageSize) return rows; } }
 async function coreCollectionId(name) { const { data: dbRow, error: dbError } = await supabase.from('admin_databases').select('id').eq('name','HSHO-PrivateServer').single(); if (dbError) throw dbError; const { data: row, error } = await supabase.from('admin_collections').select('id').eq('database_id',dbRow.id).eq('name',name).single(); if (error) throw error; return row.id; }
 const port = Number(process.env.PORT) || 3000;
 app.listen(port, () => console.log(`HSH admin listening on ${port}`));
