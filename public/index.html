@@ -11,12 +11,24 @@
     th{color:#c9ad62;font-size:11px;text-transform:uppercase;letter-spacing:.1em;font-weight:600}td{border-top:1px solid #ffffff0d} .cell{width:100%;background:transparent;border:1px solid transparent;padding:7px 8px}.cell:focus{background:#10100e;border-color:#9a792d}
     .status{font-size:11px;font-weight:700;letter-spacing:.04em;border-radius:99px;padding:5px 9px}.approved{color:#89d4a2;background:#173020}.pending{color:#e5c46a;background:#362c15}.banned{color:#f19a8c;background:#381b19}
     .raw-editor{width:100%;min-height:420px;background:#061219;border:1px solid #1b5360;border-radius:10px;padding:18px;color:#d2f3e7;font:14px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace;tab-size:2;resize:vertical;white-space:pre;overflow:auto}
+    .auth-gate{background:radial-gradient(ellipse at 50% 20%,rgba(177,132,42,.13),transparent 48%),#070707;z-index:1000}.auth-card{background:linear-gradient(145deg,rgba(31,27,18,.96),rgba(12,12,12,.98));border:1px solid rgba(220,180,74,.42);box-shadow:0 0 60px rgba(197,153,45,.12),inset 0 1px rgba(255,255,255,.04)}
     .cluster-sidebar{width:270px;min-width:270px;max-height:calc(100vh - 2rem);overflow-y:auto;transition:width .22s ease,min-width .22s ease}.cluster-sidebar.collapsed{width:66px;min-width:66px}.cluster-sidebar.collapsed .sidebar-label,.cluster-sidebar.collapsed #database-tree{display:none}.cluster-sidebar.collapsed .cluster-caption{display:inline}.cluster-sidebar.collapsed .sidebar-top{justify-content:center}.cluster-sidebar.collapsed .sidebar-actions{flex-direction:column}.cluster-sidebar.collapsed .sidebar-toggle{margin:auto}
     @media(max-width:760px){.cluster-sidebar{width:100%;min-width:0}.cluster-sidebar.collapsed{width:100%;min-width:0}.cluster-sidebar.collapsed #database-tree{display:block}.workspace{flex-direction:column}}
   </style>
 </head>
 <body class="min-h-screen">
-  <div class="max-w-[1600px] mx-auto px-4 py-5 md:px-6">
+  <section id="auth-gate" class="auth-gate fixed inset-0 grid place-items-center p-5">
+    <form class="auth-card w-full max-w-md rounded-2xl p-7" onsubmit="unlockAdmin(event)">
+      <div class="flex items-center gap-3 mb-6"><div class="w-11 h-11 rounded-xl border border-yellow-700/70 grid place-items-center text-xl gold">✦</div><div><div class="text-[10px] uppercase tracking-[.25em] text-yellow-700">HSH SovereignSoul</div><h1 class="text-xl font-semibold">Admin Login</h1></div></div>
+      <p class="text-sm text-stone-400 mb-5">ใส่รหัสผ่านแอดมินเพื่อเข้าสู่ระบบ</p>
+      <label for="login-password" class="block text-xs text-stone-400 mb-2">รหัสผ่าน</label>
+      <input id="login-password" type="password" class="w-full" autocomplete="current-password" required placeholder="Admin password">
+      <p id="login-error" class="min-h-5 text-xs text-red-400 mt-3"></p>
+      <button id="login-button" class="goldbtn w-full rounded-lg py-3 mt-2">เข้าสู่ระบบ</button>
+      <p class="text-[11px] text-stone-600 mt-4 text-center">ใช้ค่า <code>ADMIN_TOKEN</code> ที่ตั้งไว้ใน Render</p>
+    </form>
+  </section>
+  <div id="app-shell" class="max-w-[1600px] mx-auto px-4 py-5 md:px-6 hidden">
     <header class="flex flex-wrap items-center justify-between gap-5 mb-8">
       <div class="flex items-center gap-4"><div class="w-12 h-12 rounded-xl border border-yellow-700/70 grid place-items-center text-xl gold">✦</div><div><p class="text-[10px] uppercase tracking-[.28em] text-yellow-600">HSH SovereignSoul</p><h1 class="text-2xl md:text-3xl font-semibold tracking-tight">Control Room <span class="gold">/ Admin</span></h1></div></div>
       <div class="flex items-center gap-3"><span id="connection" class="text-xs text-stone-500">● Disconnected</span><button onclick="openSettings()" class="px-4 py-2 rounded-lg border border-yellow-800/70 text-sm hover:border-yellow-500">⚙ ตั้งค่าการเชื่อมต่อ</button></div>
@@ -61,11 +73,11 @@
 <script>
 let players=[],servers=[],databases=[],activeDb=null,activeCollection=null,documents=[],activeView='whitelist'; const tokenKey='hsh_admin_token';
 const token=()=>sessionStorage.getItem(tokenKey)||'';
-async function api(path,opts={}){const res=await fetch('/api'+path,{...opts,headers:{'Content-Type':'application/json','Authorization':'Bearer '+token(),...(opts.headers||{})}});const body=await res.json().catch(()=>({}));if(!res.ok)throw Error(body.error||res.statusText);return body}
+async function api(path,opts={}){const res=await fetch('/api'+path,{...opts,headers:{'Content-Type':'application/json','Authorization':'Bearer '+token(),...(opts.headers||{})}});const body=await res.json().catch(()=>({}));if(!res.ok){const err=Error(body.error||res.statusText);err.status=res.status;throw err}return body}
 function toast(msg,bad=false){const el=document.querySelector('#toast');el.textContent=msg;el.classList.remove('hidden');el.style.color=bad?'#ffaaa0':'#e7c46a';setTimeout(()=>el.classList.add('hidden'),3000)}
 function esc(s=''){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function openSettings(){document.querySelector('#token').value=token();document.querySelector('#settings').showModal()}
-async function saveSettings(e){e.preventDefault();sessionStorage.setItem(tokenKey,document.querySelector('#token').value);document.querySelector('#settings').close();await load().catch(err=>toast(err.message,true))}
+async function saveSettings(e){e.preventDefault();const previous=token();sessionStorage.setItem(tokenKey,document.querySelector('#token').value);try{await load();document.querySelector('#settings').close();toast('ยืนยันรหัสผ่านแล้ว')}catch(err){sessionStorage.setItem(tokenKey,previous);toast(err.message,true)}}
 async function load(){try{[players,servers,databases]=await Promise.all([api('/whitelists'),api('/servers'),api('/explorer')]);document.querySelector('#connection').textContent='● Connected';document.querySelector('#connection').className='text-xs text-emerald-400';renderPlayers();renderServers();renderTree();loadPublicConfig();if(activeCollection)await selectCollection(activeCollection.id)}catch(e){document.querySelector('#connection').textContent='● Disconnected';document.querySelector('#connection').className='text-xs text-red-400';throw e}}
 const whitelistFields=['steam_id','discord_id','player_name','status','notes','auth','session_token','profile','coin','amethyst','amulet','character_slot','role','ban_status','player_record','sticker_slot','inventory','immortal_data','is_online','last_online','created_at','updated_at'];
 const whitelistLabels={steam_id:'Steam ID',discord_id:'Discord ID',player_name:'ชื่อผู้เล่น',status:'Whitelist Status',notes:'หมายเหตุ',auth:'auth',session_token:'session_token',profile:'profile',coin:'coin',amethyst:'amethyst',amulet:'amulet',character_slot:'characterSlot',role:'role',ban_status:'banStatus',player_record:'playerRecord',sticker_slot:'stickerSlot',inventory:'inventory',immortal_data:'immortalData',is_online:'isOnline',last_online:'lastOnline',created_at:'createdAt',updated_at:'updatedAt'};
@@ -104,6 +116,8 @@ async function addField(){if(!activeCollection||['whitelists','serverinfo'].incl
 function parseCell(v){const t=v.trim();if(t==='true')return true;if(t==='false')return false;if(t!==''&&!Number.isNaN(Number(t)))return Number(t);if((t.startsWith('{')&&t.endsWith('}'))||(t.startsWith('[')&&t.endsWith(']'))){try{return JSON.parse(t)}catch{}}return v}
 async function patchDocument(id,key,value){try{const doc=documents.find(x=>x.id===id);const data={...doc.data,[key]:parseCell(value)};await api('/explorer/documents/'+id,{method:'PATCH',body:JSON.stringify({data})});doc.data=data;toast('บันทึกแล้ว')}catch(e){toast(e.message,true)}}
 async function removeDocument(id){if(!confirm('ลบแถวนี้?'))return;try{await api('/explorer/documents/'+id,{method:'DELETE'});documents=documents.filter(x=>x.id!==id);drawExplorer();await load();toast('ลบแถวแล้ว')}catch(e){toast(e.message,true)}}
-if(!token())openSettings();else load().catch(()=>openSettings());
+async function unlockAdmin(e){e.preventDefault();const input=document.querySelector('#login-password'),button=document.querySelector('#login-button'),error=document.querySelector('#login-error');button.disabled=true;button.textContent='กำลังตรวจสอบ…';error.textContent='';sessionStorage.setItem(tokenKey,input.value);try{await load();document.querySelector('#auth-gate').classList.add('hidden');document.querySelector('#app-shell').classList.remove('hidden');input.value=''}catch(err){sessionStorage.removeItem(tokenKey);error.textContent=err.status===401?'รหัสผ่านไม่ถูกต้อง':'เชื่อมต่อระบบไม่ได้ กรุณาตรวจการตั้งค่า Supabase บน Render';input.select()}finally{button.disabled=false;button.textContent='เข้าสู่ระบบ'}}
+async function startAdmin(){const input=document.querySelector('#login-password');if(!token()){document.querySelector('#auth-gate').classList.remove('hidden');document.querySelector('#app-shell').classList.add('hidden');input.focus();return}try{await load();document.querySelector('#auth-gate').classList.add('hidden');document.querySelector('#app-shell').classList.remove('hidden')}catch{sessionStorage.removeItem(tokenKey);document.querySelector('#auth-gate').classList.remove('hidden');document.querySelector('#app-shell').classList.add('hidden');input.focus()}}
+startAdmin();
 </script>
 </body></html>
