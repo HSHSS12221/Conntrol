@@ -78,7 +78,28 @@ app.get('/launcher/bootstrap', async (req, res, next) => {
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 app.get('/api/whitelists', async (req, res, next) => { try { res.json(await db.collection('whitelists').find({}, { orderBy: 'updated_at' })); } catch (e) { next(e); } });
 app.post('/api/whitelists', async (req, res, next) => { try { res.status(201).json(await db.collection('whitelists').insertOne(cleanWhitelist(req.body))); } catch (e) { next(e); } });
-app.patch('/api/whitelists/:id', async (req, res, next) => { try { const changes = {}; const keys = ['steam_id','discord_id','player_name','status','notes','auth','session_token','profile','coin','amethyst','amulet','character_slot','role','ban_status','player_record','sticker_slot','inventory','immortal_data','is_online','last_online']; for (const key of keys) if (Object.hasOwn(req.body, key)) changes[key] = req.body[key]; if (Object.hasOwn(changes,'steam_id')) changes.steam_id = String(changes.steam_id || '').trim(); for (const key of ['discord_id','player_name','notes','session_token','role']) if (Object.hasOwn(changes,key)) changes[key] = String(changes[key] || '').trim() || null; for (const key of ['coin','amethyst','amulet']) if (Object.hasOwn(changes,key)) changes[key] = Number(changes[key]) || 0; if (Object.hasOwn(changes,'is_online')) changes.is_online = changes.is_online === true || changes.is_online === 'true'; if (Object.hasOwn(changes,'status') && !['approved','pending','banned'].includes(changes.status)) return res.status(400).json({ error: 'Invalid status' }); res.json(await db.collection('whitelists').updateOne(req.params.id, { ...changes, updated_at: new Date().toISOString() })); } catch (e) { next(e); } });
+app.patch('/api/whitelists/:id', async (req, res, next) => { try {
+  const changes = {}; const keys = ['steam_id','discord_id','player_name','status','notes','auth','session_token','profile','coin','amethyst','amulet','character_slot','role','ban_status','player_record','sticker_slot','inventory','immortal_data','is_online','last_online'];
+  for (const key of keys) if (Object.hasOwn(req.body, key)) changes[key] = req.body[key];
+  if (Object.hasOwn(changes,'steam_id')) changes.steam_id = String(changes.steam_id || '').trim();
+  for (const key of ['discord_id','player_name','notes','session_token','role']) if (Object.hasOwn(changes,key)) changes[key] = String(changes[key] || '').trim() || null;
+  for (const key of ['coin','amethyst','amulet']) if (Object.hasOwn(changes,key)) changes[key] = Number(changes[key]) || 0;
+  if (Object.hasOwn(changes,'is_online')) changes.is_online = changes.is_online === true || changes.is_online === 'true';
+  if (Object.hasOwn(changes,'status') && !['approved','pending','banned'].includes(changes.status)) return res.status(400).json({ error: 'Invalid status' });
+  let prior = null;
+  if (changes.status === 'approved') { const { data, error } = await supabase.from('whitelists').select('status,discord_id').eq('id', req.params.id).single(); if (error) throw error; prior = data; }
+  const updated = await db.collection('whitelists').updateOne(req.params.id, { ...changes, updated_at: new Date().toISOString() });
+  let approval_dm = null;
+  if (changes.status === 'approved' && prior?.status !== 'approved') {
+    const notifyDiscordId = updated.discord_id || prior?.discord_id;
+    if (!notifyDiscordId) approval_dm = { sent: false, reason: 'No Discord ID on this player row' };
+    else {
+      try { await sendDiscordApprovalDM(notifyDiscordId); approval_dm = { sent: true }; }
+      catch (error) { console.error('[Discord] Approval DM failed:', error.message); approval_dm = { sent: false, reason: error.message }; }
+    }
+  }
+  res.json({ ...updated, approval_dm });
+} catch (e) { next(e); } });
 app.delete('/api/whitelists/:id', async (req, res, next) => { try { res.json(await db.collection('whitelists').deleteOne(req.params.id)); } catch (e) { next(e); } });
 app.post('/api/whitelists/sync-players', async (req, res, next) => { try {
   const { data: collection, error: collectionError } = await supabase.from('admin_collections').select('name').eq('id', req.body.collection_id).single(); if (collectionError) throw collectionError;
@@ -128,3 +149,16 @@ async function fetchAllRows(buildQuery, pageSize = 1000) { const rows = []; for 
 async function coreCollectionId(name) { const { data: dbRow, error: dbError } = await supabase.from('admin_databases').select('id').eq('name','HSHO-PrivateServer').single(); if (dbError) throw dbError; const { data: row, error } = await supabase.from('admin_collections').select('id').eq('database_id',dbRow.id).eq('name',name).single(); if (error) throw error; return row.id; }
 const port = Number(process.env.PORT) || 3000;
 app.listen(port, () => console.log(`HSH admin listening on ${port}`));
+async function sendDiscordApprovalDM(discordId) {
+  const baseUrl = String(process.env.DISCORD_BOT_API_URL || '').trim().replace(/\/+$/, '');
+  const secret = process.env.DISCORD_BOT_WEBHOOK_SECRET || '';
+  if (!baseUrl || !secret) throw new Error('Discord bot service URL/secret is not configured on the web service');
+  const response = await fetch(`${baseUrl}/internal/approved`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret}` },
+    body: JSON.stringify({ discord_id: discordId })
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || `Discord bot service returned ${response.status}`);
+  return result;
+}
