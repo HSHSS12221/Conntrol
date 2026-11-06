@@ -91,6 +91,10 @@ app.patch('/api/whitelists/:id', async (req, res, next) => { try {
   const updated = await db.collection('whitelists').updateOne(req.params.id, { ...changes, updated_at: new Date().toISOString() });
   let approval_dm = null;
   if (changes.status === 'approved' && prior?.status !== 'approved') {
+    try {
+      const { error: commandError } = await supabase.from('launcher_commands').insert({ command:'refresh_whitelist', payload:{ player_id:updated.id }, status:'pending' });
+      if (commandError) throw commandError;
+    } catch (error) { console.error('[Launcher] Could not queue whitelist refresh:', error.message); }
     const notifyDiscordId = updated.discord_id || prior?.discord_id;
     if (!notifyDiscordId) approval_dm = { sent: false, reason: 'No Discord ID on this player row' };
     else {
@@ -138,7 +142,17 @@ app.post('/api/commands/kill-launchers', async (req, res, next) => { try { const
 // Launcher-facing read-only endpoint; share this URL with the launcher integration.
 app.get('/public/whitelist', async (req, res, next) => { try { const status = req.query.status || 'approved'; const rows = await db.collection('whitelists').find({ status }, { limit: 5000, orderBy: 'created_at', ascending: true }); res.set('Cache-Control', 'no-store').json({ updated_at: new Date().toISOString(), players: rows.map(({ steam_id, discord_id, player_name, status }) => ({ steam_id, discord_id, player_name, status })) }); } catch (e) { next(e); } });
 app.get('/public/servers', async (req, res, next) => { try { const cid = await coreCollectionId('serverinfo'); const { data, error } = await supabase.from('admin_documents').select('data').eq('collection_id', cid).order('created_at').limit(100); if (error) throw error; const rows = data.map(x => x.data).filter(x => x.is_online !== false); res.set('Cache-Control', 'no-store').json(rows); } catch (e) { next(e); } });
-app.get('/public/launcher-config', (req, res) => { const base = (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, ''); res.set('Cache-Control','no-store').json({ host: base, serverinfo_url: `${base}/public/servers`, whitelist_url: `${base}/public/whitelist` }); });
+app.get('/public/launcher-config', async (req, res) => {
+  const base = (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
+  let discord_verify_url = '';
+  const botUrl = String(process.env.DISCORD_BOT_API_URL || '').trim().replace(/\/+$/, '');
+  if (botUrl) {
+    try { const response = await fetch(`${botUrl}/public/verify-link`); if (response.ok) discord_verify_url = (await response.json()).url || ''; }
+    catch (error) { console.warn('[Discord] Could not load verify link:', error.message); }
+  }
+  const verifyServiceUrl = String(process.env.LAUNCHER_VERIFY_PUBLIC_URL || '').trim().replace(/\/+$/, '');
+  res.set('Cache-Control','no-store').json({ host: base, serverinfo_url: `${base}/public/servers`, whitelist_url: `${base}/public/whitelist`, discord_verify_url, discord_login_url: verifyServiceUrl ? `${verifyServiceUrl}/oauth/launcher` : '' });
+});
 app.use((err, req, res, next) => { console.error(err); res.status(400).json({ error: err.message || 'Request failed' }); });
 function cleanWhitelist(x = {}) { return { steam_id: String(x.steam_id || '').trim(), discord_id: String(x.discord_id || '').trim() || null, player_name: String(x.player_name || '').trim() || null, status: ['approved','pending','banned'].includes(x.status) ? x.status : 'pending', notes: String(x.notes || '').trim() || null, auth: x.auth || [], session_token: x.session_token || null, profile: x.profile || {}, coin: Number(x.coin) || 0, amethyst: Number(x.amethyst) || 0, amulet: Number(x.amulet) || 0, character_slot: x.character_slot ?? null, role: x.role || 'survivor', ban_status: x.ban_status ?? null, player_record: x.player_record ?? null, sticker_slot: x.sticker_slot ?? null, inventory: x.inventory ?? null, immortal_data: x.immortal_data || [], is_online: Boolean(x.is_online), last_online: x.last_online || null }; }
 function cleanServer(x = {}) { return { room_name: String(x.room_name || '').trim(), host_ip: String(x.host_ip || '').trim(), port: Number(x.port) || 0, max_players: Number(x.max_players) || 0, is_online: Boolean(x.is_online), server_version: String(x.server_version || '').trim() || null, extra: x.extra && typeof x.extra === 'object' ? x.extra : {} }; }
