@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
+const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
@@ -31,15 +32,25 @@ app.use('/api', (req, res, next) => {
   if (req.headers.authorization !== `Bearer ${ADMIN_TOKEN}`) return res.status(401).json({ error: 'Unauthorized' });
   next();
 });
+app.post('/public/launcher/session', (req, res) => {
+  if (!LAUNCHER_TOKEN) return res.status(503).json({ error: 'Launcher sessions are not configured' });
+  const clientId = String(req.body.client_id || '').trim();
+  if (!/^[0-9a-f-]{36}$/i.test(clientId)) return res.status(400).json({ error: 'A valid client_id is required' });
+  res.set('Cache-Control', 'no-store').json({ client_id: clientId, client_token: signLauncherClient(clientId) });
+});
 app.get('/launcher/commands', async (req, res, next) => {
   if (!supabase) return res.status(503).json({ error: 'Supabase is not configured' });
-  if (!LAUNCHER_TOKEN || req.headers.authorization !== `Bearer ${LAUNCHER_TOKEN}`) return res.status(401).json({ error: 'Unauthorized' });
-  try { res.set('Cache-Control', 'no-store').json(await db.collection('launcher_commands').find({ status: 'pending' }, { limit: 50, orderBy: 'created_at', ascending: true })); } catch (e) { next(e); }
+  const clientId = String(req.query.client_id || '').trim();
+  if (!clientId || clientId.length > 100) return res.status(400).json({ error: 'client_id is required' });
+  if (!verifyLauncherClient(clientId, req.headers.authorization)) return res.status(401).json({ error: 'Unauthorized' });
+  try { const { data, error } = await supabase.rpc('get_pending_launcher_commands', { p_client_id: clientId }); if (error) throw error; res.set('Cache-Control', 'no-store').json(data); } catch (e) { next(e); }
 });
 app.post('/launcher/commands/:id/ack', async (req, res, next) => {
   if (!supabase) return res.status(503).json({ error: 'Supabase is not configured' });
-  if (!LAUNCHER_TOKEN || req.headers.authorization !== `Bearer ${LAUNCHER_TOKEN}`) return res.status(401).json({ error: 'Unauthorized' });
-  try { res.json(await db.collection('launcher_commands').updateOne(req.params.id, { status: ['received','completed','failed'].includes(req.body.status) ? req.body.status : 'received' })); } catch (e) { next(e); }
+  const clientId = String(req.body.client_id || '').trim();
+  if (!clientId || clientId.length > 100) return res.status(400).json({ error: 'client_id is required' });
+  if (!verifyLauncherClient(clientId, req.headers.authorization)) return res.status(401).json({ error: 'Unauthorized' });
+  try { const { error } = await supabase.from('launcher_command_deliveries').upsert({ command_id: req.params.id, client_id: clientId }, { onConflict: 'command_id,client_id' }); if (error) throw error; res.json({ received: true }); } catch (e) { next(e); }
 });
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 app.get('/api/whitelists', async (req, res, next) => { try { res.json(await db.collection('whitelists').find({}, { orderBy: 'updated_at' })); } catch (e) { next(e); } });
@@ -88,6 +99,8 @@ app.use((err, req, res, next) => { console.error(err); res.status(400).json({ er
 function cleanWhitelist(x = {}) { return { steam_id: String(x.steam_id || '').trim(), discord_id: String(x.discord_id || '').trim() || null, player_name: String(x.player_name || '').trim() || null, status: ['approved','pending','banned'].includes(x.status) ? x.status : 'pending', notes: String(x.notes || '').trim() || null, auth: x.auth || [], session_token: x.session_token || null, profile: x.profile || {}, coin: Number(x.coin) || 0, amethyst: Number(x.amethyst) || 0, amulet: Number(x.amulet) || 0, character_slot: x.character_slot ?? null, role: x.role || 'survivor', ban_status: x.ban_status ?? null, player_record: x.player_record ?? null, sticker_slot: x.sticker_slot ?? null, inventory: x.inventory ?? null, immortal_data: x.immortal_data || [], is_online: Boolean(x.is_online), last_online: x.last_online || null }; }
 function cleanServer(x = {}) { return { room_name: String(x.room_name || '').trim(), host_ip: String(x.host_ip || '').trim(), port: Number(x.port) || 0, max_players: Number(x.max_players) || 0, is_online: Boolean(x.is_online), server_version: String(x.server_version || '').trim() || null, extra: x.extra && typeof x.extra === 'object' ? x.extra : {} }; }
 function safeName(value) { const name = String(value || '').trim(); if (!/^[a-zA-Z][a-zA-Z0-9_-]{1,39}$/.test(name)) throw new Error('ใช้ชื่อ 2-40 ตัวอักษร เริ่มด้วย a-z และใช้ได้เฉพาะตัวเลข _ -'); return name; }
+function signLauncherClient(clientId) { return crypto.createHmac('sha256', LAUNCHER_TOKEN).update(`launcher-client-v1:${clientId}`).digest('hex'); }
+function verifyLauncherClient(clientId, authorization) { if (!LAUNCHER_TOKEN || !authorization?.startsWith('Bearer ')) return false; const supplied = Buffer.from(authorization.slice(7), 'hex'); const expected = Buffer.from(signLauncherClient(clientId), 'hex'); return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected); }
 async function coreCollectionId(name) { const { data: dbRow, error: dbError } = await supabase.from('admin_databases').select('id').eq('name','HSHO-PrivateServer').single(); if (dbError) throw dbError; const { data: row, error } = await supabase.from('admin_collections').select('id').eq('database_id',dbRow.id).eq('name',name).single(); if (error) throw error; return row.id; }
 const port = Number(process.env.PORT) || 3000;
 app.listen(port, () => console.log(`HSH admin listening on ${port}`));
