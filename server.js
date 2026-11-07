@@ -10,6 +10,8 @@ app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, ADMIN_TOKEN, LAUNCHER_TOKEN } = process.env;
+function publicBaseUrl(req) { return (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, ''); }
+function publishedServerInfoUrl(req) { return `${publicBaseUrl(req)}/public/servers`; }
 const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } }) : null;
 const db = {
@@ -64,12 +66,12 @@ app.get('/launcher/bootstrap', async (req, res, next) => {
       fetchAllRows(() => supabase.from('admin_documents').select('data').eq('collection_id', serverInfoCollectionId).order('created_at')),
       fetchAllRows(() => supabase.from('whitelists').select('*').order('created_at'))
     ]);
-    const base = (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
+    const base = publicBaseUrl(req);
     const players = playerRows.map(({ auth, session_token, notes, ...player }) => player);
     res.set('Cache-Control', 'no-store').json({
       updated_at: new Date().toISOString(),
       host: base,
-      urls: { serverinfo: `${base}/public/servers`, whitelist: `${base}/public/whitelist` },
+      urls: { serverinfo: publishedServerInfoUrl(req), whitelist: `${base}/public/whitelist` },
       serverinfo: serverRows.map(row => row.data),
       players
     });
@@ -141,9 +143,39 @@ app.delete('/api/explorer/documents/:id', async (req, res, next) => { try { cons
 app.post('/api/commands/kill-launchers', async (req, res, next) => { try { const command = await db.collection('launcher_commands').insertOne({ command: 'kill_all_launchers', payload: {}, status: 'pending' }); res.status(201).json(command); } catch (e) { next(e); } });
 // Launcher-facing read-only endpoint; share this URL with the launcher integration.
 app.get('/public/whitelist', async (req, res, next) => { try { const status = req.query.status || 'approved'; const rows = await db.collection('whitelists').find({ status }, { limit: 5000, orderBy: 'created_at', ascending: true }); res.set('Cache-Control', 'no-store').json({ updated_at: new Date().toISOString(), players: rows.map(({ steam_id, discord_id, player_name, status }) => ({ steam_id, discord_id, player_name, status })) }); } catch (e) { next(e); } });
-app.get('/public/servers', async (req, res, next) => { try { const cid = await coreCollectionId('serverinfo'); const { data, error } = await supabase.from('admin_documents').select('data').eq('collection_id', cid).order('created_at').limit(100); if (error) throw error; const rows = data.map(x => x.data).filter(x => x.is_online !== false); res.set('Cache-Control', 'no-store').json(rows); } catch (e) { next(e); } });
+app.get('/public/servers', async (req, res, next) => { try { const cid = await coreCollectionId('serverinfo'); const { data, error } = await supabase.from('admin_documents').select('data').eq('collection_id', cid).order('created_at').limit(100); if (error) throw error; const rows = data.map(x => x.data).filter(x => x.is_online !== false && x.IsOnline !== false); res.set('Cache-Control', 'no-store').json(rows); } catch (e) { next(e); } });
+app.post('/live/player/gameplay/checkversion', async (req, res, next) => { try {
+  const cid = await coreCollectionId('serverinfo');
+  const { data: docs, error: docsError } = await supabase.from('admin_documents').select('data').eq('collection_id', cid).order('created_at').limit(100);
+  if (docsError) throw docsError;
+  const records = (docs || []).map(row => row.data).filter(x => x && typeof x === 'object' && !Array.isArray(x));
+  const info = records.find(x => readBoolean(x.IsOnline ?? x.is_online, true)) || records[0];
+  if (!info) return res.status(503).json({ status: 0, data: null, error: 'ServerInfo is not configured' });
+  const version = String(info.serverVersion ?? info.server_version ?? '').trim();
+  if (!version) return res.status(503).json({ status: 0, data: null, error: 'ServerInfo serverVersion is missing' });
+  const serverInfo = {
+    correctversion: readBoolean(info.correctversion ?? info.correctVersion, true),
+    serverVersion: version,
+    ServerDevVersion: String(info.ServerDevVersion ?? info.serverDevVersion ?? '0.0.0.1'),
+    IsOnline: readBoolean(info.IsOnline ?? info.is_online, true),
+    IsDevOnline: readBoolean(info.IsDevOnline ?? info.is_dev_online, false)
+  };
+  if (!serverInfo.IsOnline) return res.status(200).json({ status: 0, data: { serverInfo: { ...serverInfo, correctversion: false } }, error: 'Server cannot be played during maintenance' });
+  const clientVersion = req.body?.clientversion ?? req.body?.clientVersion;
+  if (clientVersion !== version) return res.status(200).json({ status: 0, data: { serverInfo: { ...serverInfo, correctversion: false } }, error: 'Client version mismatch. Please update your game.' });
+
+  const playerId = req.body?.playerId ?? req.body?.Player?.[0]?.playerId;
+  if (playerId !== undefined && playerId !== null && String(playerId).trim()) {
+    const { data: player, error: playerError } = await supabase.from('whitelists').select('steam_id,status').eq('steam_id', String(playerId).trim()).maybeSingle();
+    if (playerError) throw playerError;
+    if (!player) return res.status(200).json({ status: 0, data: { serverInfo }, error: 'Invalid player ID.' });
+    if (player.status === 'banned') return res.status(403).json({ status: 0, data: null, error: 'Your account has been banned' });
+    if (player.status !== 'approved') return res.status(403).json({ status: 0, data: null, error: 'Your whitelist is not approved' });
+  }
+  res.json({ status: 1, data: { serverInfo }, error: null });
+} catch (e) { console.error('[Game API checkversion]', e); res.status(503).json({ status: 0, data: null, error: 'Could not load ServerInfo from Supabase' }); } });
 app.get('/public/launcher-config', async (req, res) => {
-  const base = (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
+  const base = publicBaseUrl(req);
   let discord_verify_url = '';
   const botUrl = String(process.env.DISCORD_BOT_API_URL || '').trim().replace(/\/+$/, '');
   if (botUrl) {
@@ -151,11 +183,12 @@ app.get('/public/launcher-config', async (req, res) => {
     catch (error) { console.warn('[Discord] Could not load verify link:', error.message); }
   }
   const verifyServiceUrl = String(process.env.LAUNCHER_VERIFY_PUBLIC_URL || '').trim().replace(/\/+$/, '');
-  res.set('Cache-Control','no-store').json({ host: base, serverinfo_url: `${base}/public/servers`, whitelist_url: `${base}/public/whitelist`, discord_verify_url, discord_login_url: verifyServiceUrl ? `${verifyServiceUrl}/oauth/launcher` : '' });
+  res.set('Cache-Control','no-store').json({ host: base, serverinfo_url: publishedServerInfoUrl(req), game_api_url: `${base}/live/player/gameplay/checkversion`, whitelist_url: `${base}/public/whitelist`, discord_verify_url, discord_login_url: verifyServiceUrl ? `${verifyServiceUrl}/oauth/launcher` : '' });
 });
 app.use((err, req, res, next) => { console.error(err); res.status(400).json({ error: err.message || 'Request failed' }); });
 function cleanWhitelist(x = {}) { return { steam_id: String(x.steam_id || '').trim(), discord_id: String(x.discord_id || '').trim() || null, player_name: String(x.player_name || '').trim() || null, status: ['approved','pending','banned'].includes(x.status) ? x.status : 'pending', notes: String(x.notes || '').trim() || null, auth: x.auth || [], session_token: x.session_token || null, profile: x.profile || {}, coin: Number(x.coin) || 0, amethyst: Number(x.amethyst) || 0, amulet: Number(x.amulet) || 0, character_slot: x.character_slot ?? null, role: x.role || 'survivor', ban_status: x.ban_status ?? null, player_record: x.player_record ?? null, sticker_slot: x.sticker_slot ?? null, inventory: x.inventory ?? null, immortal_data: x.immortal_data || [], is_online: Boolean(x.is_online), last_online: x.last_online || null }; }
 function cleanServer(x = {}) { return { room_name: String(x.room_name || '').trim(), host_ip: String(x.host_ip || '').trim(), port: Number(x.port) || 0, max_players: Number(x.max_players) || 0, is_online: Boolean(x.is_online), server_version: String(x.server_version || '').trim() || null, extra: x.extra && typeof x.extra === 'object' ? x.extra : {} }; }
+function readBoolean(value, fallback) { if (typeof value === 'boolean') return value; if (typeof value === 'string') { if (value.toLowerCase() === 'true') return true; if (value.toLowerCase() === 'false') return false; } return fallback; }
 function safeName(value) { const name = String(value || '').trim(); if (!/^[a-zA-Z][a-zA-Z0-9_-]{1,39}$/.test(name)) throw new Error('ใช้ชื่อ 2-40 ตัวอักษร เริ่มด้วย a-z และใช้ได้เฉพาะตัวเลข _ -'); return name; }
 function signLauncherClient(clientId) { return crypto.createHmac('sha256', LAUNCHER_TOKEN).update(`launcher-client-v1:${clientId}`).digest('hex'); }
 function verifyLauncherClient(clientId, authorization) { if (!LAUNCHER_TOKEN || !authorization?.startsWith('Bearer ')) return false; const supplied = Buffer.from(authorization.slice(7), 'hex'); const expected = Buffer.from(signLauncherClient(clientId), 'hex'); return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected); }
