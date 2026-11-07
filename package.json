@@ -5,9 +5,20 @@
   "description": "Gold and black HSH SovereignSoul admin console backed by Supabase",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=20.0.0" },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",
     "dotenv": "^17.2.2",
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "module-alias": "^2.2.3"
+  },
+  "_moduleAliases": {
+    "@config": "src/config",
+    "@routes": "src/routes",
+    "@utils": "src/utils",
+    "@src": "src",
+    "@models": "src/models",
+    "@services": "src/services",
+    "@controllers": "src/controllers"
   }
 }
