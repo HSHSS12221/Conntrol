@@ -145,6 +145,24 @@ app.post('/api/commands/kill-launchers', async (req, res, next) => { try { const
 // Launcher-facing read-only endpoint; share this URL with the launcher integration.
 app.get('/public/whitelist', async (req, res, next) => { try { const status = req.query.status || 'approved'; const rows = await db.collection('whitelists').find({ status }, { limit: 5000, orderBy: 'created_at', ascending: true }); res.set('Cache-Control', 'no-store').json({ updated_at: new Date().toISOString(), players: rows.map(({ steam_id, discord_id, player_name, status }) => ({ steam_id, discord_id, player_name, status })) }); } catch (e) { next(e); } });
 app.get('/public/servers', async (req, res, next) => { try { const cid = await coreCollectionId('serverinfo'); const { data, error } = await supabase.from('admin_documents').select('data').eq('collection_id', cid).order('created_at').limit(100); if (error) throw error; const rows = data.map(x => x.data).filter(x => x.is_online !== false && x.IsOnline !== false); res.set('Cache-Control', 'no-store').json(rows); } catch (e) { next(e); } });
+async function readGameServerInfo() {
+  const cid = await coreCollectionId('serverinfo');
+  const { data, error } = await supabase.from('admin_documents').select('data').eq('collection_id', cid).order('created_at').limit(100);
+  if (error) throw error;
+  const records = (data || []).map(row => row.data).filter(value => value && typeof value === 'object' && !Array.isArray(value));
+  const info = records.find(value => readBoolean(value.IsOnline ?? value.is_online, true)) || records[0];
+  if (!info) throw new Error('ServerInfo is not configured in Cluster0 / HSHO-PrivateServer / serverinfo');
+  const version = String(info.serverVersion ?? info.server_version ?? '').trim();
+  if (!version) throw new Error('ServerInfo serverVersion is missing');
+  return { serverInfo: {
+    ...info,
+    correctversion: readBoolean(info.correctversion ?? info.correctVersion, true),
+    serverVersion: version,
+    ServerDevVersion: String(info.ServerDevVersion ?? info.serverDevVersion ?? '0.0.0.1'),
+    IsOnline: readBoolean(info.IsOnline ?? info.is_online, true),
+    IsDevOnline: readBoolean(info.IsDevOnline ?? info.is_dev_online, false)
+  } };
+}
 app.post('/live/player/authen', async (req, res) => {
   try {
     if (String(req.body?.authType || '').toLowerCase() !== 'steam') return gameError(res, 400, 'Only Steam authentication is supported');
@@ -152,7 +170,7 @@ app.post('/live/player/authen', async (req, res) => {
     if (!/^(?:[a-f0-9]{2}){20,8192}$/i.test(ticket)) return gameError(res, 400, 'A valid Steam session ticket is required');
 
     const publisherKey = String(process.env.STEAM_PUBLISHER_KEY || '').trim();
-    const appId = String(process.env.STEAM_APP_ID || '2334220').trim();
+    const appId = String(process.env.STEAM_APP_ID || '480').trim();
     if (!publisherKey || !/^\d+$/.test(appId)) return gameError(res, 503, 'Steam ticket validation is not configured');
     const steamUrl = new URL('https://partner.steam-api.com/ISteamUserAuth/AuthenticateUserTicket/v1/');
     steamUrl.searchParams.set('key', publisherKey);
@@ -174,6 +192,10 @@ app.post('/live/player/authen', async (req, res) => {
     if (row.status === 'banned' || isBanActive(row.ban_status)) return gameError(res, 403, 'Your account has been banned');
     if (row.status !== 'approved') return gameError(res, 403, 'Your whitelist is not approved');
 
+    // Load ServerInfo before updating session state so configuration failures
+    // are reported clearly and do not leave a half-created login session.
+    const { serverInfo } = await readGameServerInfo();
+
     const now = new Date().toISOString();
     const sessionToken = issueGameSessionToken(steamId);
     const authEntries = Array.isArray(row.auth) ? [...row.auth] : structuredClone(authTemplate.data.player.auth || []);
@@ -183,7 +205,6 @@ app.post('/live/player/authen', async (req, res) => {
     const { data: saved, error: saveError } = await supabase.from('whitelists').update({ auth: updatedAuth, session_token: sessionToken, is_online: true, last_online: now, updated_at: now }).eq('id', row.id).select('*').single();
     if (saveError) throw saveError;
 
-    const { serverInfo } = await readGameServerInfo();
     const response = structuredClone(authTemplate);
     const player = response.data.player;
     player._id = steamId;
