@@ -144,6 +144,18 @@ app.post('/api/commands/kill-launchers', async (req, res, next) => { try { const
 // Launcher-facing read-only endpoint; share this URL with the launcher integration.
 app.get('/public/whitelist', async (req, res, next) => { try { const status = req.query.status || 'approved'; const rows = await db.collection('whitelists').find({ status }, { limit: 5000, orderBy: 'created_at', ascending: true }); res.set('Cache-Control', 'no-store').json({ updated_at: new Date().toISOString(), players: rows.map(({ steam_id, discord_id, player_name, status }) => ({ steam_id, discord_id, player_name, status })) }); } catch (e) { next(e); } });
 app.get('/public/servers', async (req, res, next) => { try { const cid = await coreCollectionId('serverinfo'); const { data, error } = await supabase.from('admin_documents').select('data').eq('collection_id', cid).order('created_at').limit(100); if (error) throw error; const rows = data.map(x => x.data).filter(x => x.is_online !== false && x.IsOnline !== false); res.set('Cache-Control', 'no-store').json(rows); } catch (e) { next(e); } });
+app.get('/live/player/gameplay/checkversion', async (_req, res) => { try {
+  const cid = await coreCollectionId('serverinfo');
+  const { data, error } = await supabase.from('admin_documents').select('data').eq('collection_id', cid).order('created_at').limit(100);
+  if (error) throw error;
+  const records = (data || []).map(row => row.data).filter(x => x && typeof x === 'object' && !Array.isArray(x));
+  const info = records.find(x => readBoolean(x.IsOnline ?? x.is_online, true)) || records[0];
+  if (!info) return res.status(503).json({ status: 0, data: null, error: 'ServerInfo is not configured' });
+  const version = String(info.serverVersion ?? info.server_version ?? '').trim();
+  if (!version) return res.status(503).json({ status: 0, data: null, error: 'ServerInfo serverVersion is missing' });
+  const serverInfo = { correctversion: readBoolean(info.correctversion ?? info.correctVersion, true), serverVersion: version, ServerDevVersion: String(info.ServerDevVersion ?? info.serverDevVersion ?? '0.0.0.1'), IsOnline: readBoolean(info.IsOnline ?? info.is_online, true), IsDevOnline: readBoolean(info.IsDevOnline ?? info.is_dev_online, false) };
+  res.set('Cache-Control', 'no-store').json({ status: 1, data: { serverInfo }, error: null });
+} catch (e) { console.error('[Game API checkversion GET]', e); res.status(503).json({ status: 0, data: null, error: 'Could not load ServerInfo from Supabase' }); } });
 app.post('/live/player/gameplay/checkversion', async (req, res, next) => { try {
   const cid = await coreCollectionId('serverinfo');
   const { data: docs, error: docsError } = await supabase.from('admin_documents').select('data').eq('collection_id', cid).order('created_at').limit(100);
