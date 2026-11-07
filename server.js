@@ -9,6 +9,11 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+const adminLogs = [];
+function recordAdminLog(level, source, message, status = null) {
+  adminLogs.unshift({ at: new Date().toISOString(), level, source, message: String(message).slice(0, 240), status });
+  if (adminLogs.length > 300) adminLogs.length = 300;
+}
 
 const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, ADMIN_TOKEN, LAUNCHER_TOKEN } = process.env;
 function publicBaseUrl(req) { return (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, ''); }
@@ -34,6 +39,10 @@ app.use('/api', (req, res, next) => {
   if (!ADMIN_TOKEN) return res.status(503).json({ error: 'Set ADMIN_TOKEN on the server.' });
   if (req.headers.authorization !== `Bearer ${ADMIN_TOKEN}`) return res.status(401).json({ error: 'Unauthorized' });
   next();
+});
+app.get('/api/logs', (req, res) => {
+  const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 100));
+  res.set('Cache-Control', 'no-store').json(adminLogs.slice(0, limit));
 });
 app.post('/public/launcher/session', (req, res) => {
   if (!LAUNCHER_TOKEN) return res.status(503).json({ error: 'Launcher sessions are not configured' });
@@ -164,14 +173,15 @@ async function readGameServerInfo() {
   } };
 }
 app.post('/live/player/authen', async (req, res) => {
+  recordAdminLog('info', 'Steam Auth', 'Received POST /live/player/authen');
   try {
-    if (String(req.body?.authType || '').toLowerCase() !== 'steam') return gameError(res, 400, 'Only Steam authentication is supported');
+    if (String(req.body?.authType || '').toLowerCase() !== 'steam') { recordAdminLog('warn', 'Steam Auth', 'Rejected request: authType is not steam', 400); return gameError(res, 400, 'Only Steam authentication is supported'); }
     const ticket = String(req.body?.ticket || '').trim();
-    if (!/^(?:[a-f0-9]{2}){20,8192}$/i.test(ticket)) return gameError(res, 400, 'A valid Steam session ticket is required');
+    if (!/^(?:[a-f0-9]{2}){20,8192}$/i.test(ticket)) { recordAdminLog('warn', 'Steam Auth', 'Rejected request: Steam ticket missing or malformed', 400); return gameError(res, 400, 'A valid Steam session ticket is required'); }
 
     const publisherKey = String(process.env.STEAM_PUBLISHER_KEY || '').trim();
     const appId = String(process.env.STEAM_APP_ID || '480').trim();
-    if (!publisherKey || !/^\d+$/.test(appId)) return gameError(res, 503, 'Steam ticket validation is not configured');
+    if (!publisherKey || !/^\d+$/.test(appId)) { recordAdminLog('error', 'Steam Auth', 'Steam ticket validation environment is incomplete', 503); return gameError(res, 503, 'Steam ticket validation is not configured'); }
     const steamUrl = new URL('https://partner.steam-api.com/ISteamUserAuth/AuthenticateUserTicket/v1/');
     steamUrl.searchParams.set('key', publisherKey);
     steamUrl.searchParams.set('appid', appId);
@@ -183,26 +193,29 @@ app.post('/live/player/authen', async (req, res) => {
     if (!steamResponse.ok) {
       // Do not log the request URL; it contains the private API key and ticket.
       console.warn('[Steam Auth] Steam returned HTTP', steamResponse.status, 'content-type:', steamContentType);
+      recordAdminLog('error', 'Steam Auth', `Steam returned HTTP ${steamResponse.status} (${steamContentType})`, 502);
       return gameError(res, 502, `Steam authentication service returned HTTP ${steamResponse.status}`);
     }
     let steamPayload;
     try { steamPayload = JSON.parse(steamBody); }
     catch {
       console.warn('[Steam Auth] Steam returned non-JSON response; content-type:', steamContentType);
+      recordAdminLog('error', 'Steam Auth', `Steam returned non-JSON response (${steamContentType})`, 502);
       return gameError(res, 502, 'Steam authentication service returned an invalid response');
     }
     const steamId = String(steamPayload?.response?.params?.steamid || '');
-    if (!/^\d{17}$/.test(steamId)) return gameError(res, 401, 'Steam rejected the session ticket');
+    if (!/^\d{17}$/.test(steamId)) { recordAdminLog('warn', 'Steam Auth', 'Steam response did not contain a valid SteamID; ticket rejected', 401); return gameError(res, 401, 'Steam rejected the session ticket'); }
 
     const { data: row, error: playerError } = await supabase.from('whitelists').select('*').eq('steam_id', steamId).maybeSingle();
     if (playerError) throw playerError;
-    if (!row) return gameError(res, 403, 'Steam account is not on the whitelist');
-    if (row.status === 'banned' || isBanActive(row.ban_status)) return gameError(res, 403, 'Your account has been banned');
-    if (row.status !== 'approved') return gameError(res, 403, 'Your whitelist is not approved');
+    if (!row) { recordAdminLog('warn', 'Steam Auth', 'Authenticated SteamID is absent from whitelist', 403); return gameError(res, 403, 'Steam account is not on the whitelist'); }
+    if (row.status === 'banned' || isBanActive(row.ban_status)) { recordAdminLog('warn', 'Steam Auth', 'Whitelist rejected: player is banned', 403); return gameError(res, 403, 'Your account has been banned'); }
+    if (row.status !== 'approved') { recordAdminLog('warn', 'Steam Auth', `Whitelist rejected: status is ${row.status}`, 403); return gameError(res, 403, 'Your whitelist is not approved'); }
 
     // Load ServerInfo before updating session state so configuration failures
     // are reported clearly and do not leave a half-created login session.
     const { serverInfo } = await readGameServerInfo();
+    recordAdminLog('info', 'Steam Auth', 'Steam ticket and whitelist passed; ServerInfo loaded');
 
     const now = new Date().toISOString();
     const sessionToken = issueGameSessionToken(steamId);
@@ -233,9 +246,11 @@ app.post('/live/player/authen', async (req, res) => {
     response.data.session_token = sessionToken;
     response.data.serverInfo = serverInfo;
     response.error = null;
+    recordAdminLog('info', 'Steam Auth', 'Authentication completed successfully', 200);
     res.status(200).json(response);
   } catch (error) {
     console.error('[Steam Auth]', error.message);
+    recordAdminLog('error', 'Steam Auth', error.message || 'Authentication failed', 503);
     gameError(res, 503, 'Steam authentication could not be completed');
   }
 });
