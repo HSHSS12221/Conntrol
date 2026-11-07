@@ -21,12 +21,26 @@ function recordAdminLog(level, source, message, status = null) {
   adminLogs.unshift({ at: new Date().toISOString(), level, source, message: String(message).slice(0, 240), status });
   if (adminLogs.length > 300) adminLogs.length = 300;
 }
+app.use((req, res, next) => {
+  const requestPath = req.path;
+  if (!/^\/(?:live|logapi)\//i.test(requestPath)) return next();
+  const startedAt = Date.now();
+  res.once('finish', () => recordAdminLog(
+    res.statusCode >= 400 ? 'warn' : 'info',
+    'Game API',
+    `${req.method} ${requestPath} -> HTTP ${res.statusCode} (${Date.now() - startedAt}ms)`,
+    res.statusCode
+  ));
+  next();
+});
 
-const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, ADMIN_TOKEN, LAUNCHER_TOKEN } = process.env;
+const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_SECRET_KEY, ADMIN_TOKEN, LAUNCHER_TOKEN } = process.env;
 function publicBaseUrl(req) { return (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, ''); }
 function publishedServerInfoUrl(req) { return `${publicBaseUrl(req)}/public/servers`; }
-const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } }) : null;
+// Prefer Supabase's current server-only secret key; keep the legacy variable for existing deployments.
+const supabaseServerKey = SUPABASE_SECRET_KEY || SUPABASE_SERVICE_ROLE_KEY;
+const supabase = SUPABASE_URL && supabaseServerKey
+  ? createClient(SUPABASE_URL, supabaseServerKey, { auth: { persistSession: false } }) : null;
 const gameDataService = supabase ? createGameDataService(supabase) : null;
 const whitelistRepository = supabase ? createWhitelistRepository(supabase) : null;
 if (supabase) { PlayerModel.configure(supabase); ServerInfoModel.configure(supabase); staticJsonUtil.configure(supabase); gameHealthRoutes.configure(supabase); }
@@ -203,11 +217,12 @@ app.post('/live/player/authen', async (req, res) => {
     const ticket = String(req.body?.ticket || '').trim();
     if (!/^(?:[a-f0-9]{2}){20,8192}$/i.test(ticket)) { recordAdminLog('warn', 'Steam Auth', 'Rejected request: Steam ticket missing or malformed', 400); return gameError(res, 400, 'A valid Steam session ticket is required'); }
 
-    const publisherKey = String(process.env.STEAM_PUBLISHER_KEY || '').trim();
+    const steamApiKey = String(process.env.STEAM_WEB_API_KEY || process.env.STEAM_PUBLISHER_KEY || '').trim();
     const appId = String(process.env.STEAM_APP_ID || '480').trim();
-    if (!publisherKey || !/^\d+$/.test(appId)) { recordAdminLog('error', 'Steam Auth', 'Steam ticket validation environment is incomplete', 503); return gameError(res, 503, 'Steam ticket validation is not configured'); }
-    const steamUrl = new URL('https://partner.steam-api.com/ISteamUserAuth/AuthenticateUserTicket/v1/');
-    steamUrl.searchParams.set('key', publisherKey);
+    const steamHost = String(process.env.STEAM_API_HOST || 'api.steampowered.com').trim().toLowerCase();
+    if (!steamApiKey || !/^\d+$/.test(appId) || !['api.steampowered.com', 'partner.steam-api.com'].includes(steamHost)) { recordAdminLog('error', 'Steam Auth', 'Steam ticket validation environment is incomplete or invalid', 503); return gameError(res, 503, 'Steam ticket validation is not configured'); }
+    const steamUrl = new URL(`https://${steamHost}/ISteamUserAuth/AuthenticateUserTicket/v1/`);
+    steamUrl.searchParams.set('key', steamApiKey);
     steamUrl.searchParams.set('appid', appId);
     steamUrl.searchParams.set('ticket', ticket);
     if (process.env.STEAM_TICKET_IDENTITY) steamUrl.searchParams.set('identity', process.env.STEAM_TICKET_IDENTITY);
@@ -335,6 +350,12 @@ app.use('/', gameHealthRoutes);
 // Existing auth/checkversion handlers above take precedence; remaining routes
 // are served by the adapted game API router.
 app.use('/', require('./src/routes/index'));
+// Keep unknown game routes machine-readable and visible in Admin → System Logs.
+app.use(['/live', '/logapi'], (req, res) => {
+  const path = req.originalUrl.split('?')[0];
+  recordAdminLog('warn', 'Game API', `No handler registered for ${req.method} ${path}`, 404);
+  gameError(res, 404, `Game API endpoint is not implemented: ${req.method} ${path}`);
+});
 app.use((err, req, res, next) => { console.error(err); res.status(400).json({ error: err.message || 'Request failed' }); });
 function cleanWhitelist(x = {}) { return { steam_id: String(x.steam_id || '').trim(), discord_id: String(x.discord_id || '').trim() || null, player_name: String(x.player_name || '').trim() || null, status: ['approved','pending','banned'].includes(x.status) ? x.status : 'pending', notes: String(x.notes || '').trim() || null, auth: x.auth || [], session_token: x.session_token || null, profile: x.profile || {}, coin: Number(x.coin) || 0, amethyst: Number(x.amethyst) || 0, amulet: Number(x.amulet) || 0, character_slot: x.character_slot ?? null, role: x.role || 'survivor', ban_status: x.ban_status ?? null, player_record: x.player_record ?? null, sticker_slot: x.sticker_slot ?? null, inventory: x.inventory ?? null, immortal_data: x.immortal_data || [], game_data: x.game_data && typeof x.game_data === 'object' ? x.game_data : {}, is_online: Boolean(x.is_online), last_online: x.last_online || null }; }
 function cleanServer(x = {}) { return { room_name: String(x.room_name || '').trim(), host_ip: String(x.host_ip || '').trim(), port: Number(x.port) || 0, max_players: Number(x.max_players) || 0, is_online: Boolean(x.is_online), server_version: String(x.server_version || '').trim() || null, extra: x.extra && typeof x.extra === 'object' ? x.extra : {} }; }
