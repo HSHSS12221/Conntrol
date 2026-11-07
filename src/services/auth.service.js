@@ -34,7 +34,8 @@ class AuthService {
     if (!/^(?:[a-f0-9]{2}){20,8192}$/i.test(String(ticket || ''))) return { success: false, error: 'Invalid Steam session ticket' };
     if (!config.steam.apiKey || !/^\d+$/.test(String(config.steam.appId))) return { success: false, error: 'Steam ticket validation is not configured' };
     try {
-      const url = new URL('https://partner.steam-api.com/ISteamUserAuth/AuthenticateUserTicket/v1/');
+      const host = ['api.steampowered.com', 'partner.steam-api.com'].includes(String(config.steam.apiHost).toLowerCase()) ? String(config.steam.apiHost).toLowerCase() : 'api.steampowered.com';
+      const url = new URL(`https://${host}/ISteamUserAuth/AuthenticateUserTicket/v1/`);
       url.searchParams.set('key', config.steam.apiKey);
       url.searchParams.set('appid', config.steam.appId);
       url.searchParams.set('ticket', ticket);
