@@ -1,9 +1,16 @@
+require('module-alias/register');
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
 const authTemplate = require('./templates/auth.json');
 const { createClient } = require('@supabase/supabase-js');
+const { createGameDataService } = require('./src/services/game-data.service');
+const { createWhitelistRepository } = require('./src/repositories/whitelist.repository');
+const PlayerModel = require('./src/models/player.model');
+const ServerInfoModel = require('./src/models/server.model');
+const staticJsonUtil = require('./src/utils/static-json.util');
+const gameHealthRoutes = require('./src/Health');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -20,6 +27,9 @@ function publicBaseUrl(req) { return (process.env.PUBLIC_BASE_URL || `${req.prot
 function publishedServerInfoUrl(req) { return `${publicBaseUrl(req)}/public/servers`; }
 const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } }) : null;
+const gameDataService = supabase ? createGameDataService(supabase) : null;
+const whitelistRepository = supabase ? createWhitelistRepository(supabase) : null;
+if (supabase) { PlayerModel.configure(supabase); ServerInfoModel.configure(supabase); staticJsonUtil.configure(supabase); gameHealthRoutes.configure(supabase); }
 const db = {
   collection(table) {
     return {
@@ -88,10 +98,13 @@ app.get('/launcher/bootstrap', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 app.get('/api/health', (req, res) => res.json({ ok: true }));
+app.get('/api/game-data', async (_req, res, next) => { try { res.set('Cache-Control', 'no-store').json(await gameDataService.list()); } catch (e) { next(e); } });
+app.get('/api/game-data/file', async (req, res) => { try { const item = await gameDataService.get(req.query.path); if (!item) return res.status(404).json({ error: 'Game data file has not been synced to Supabase' }); res.set('Cache-Control', 'no-store').json(item); } catch (e) { res.status(400).json({ error: e.message }); } });
+app.post('/api/game-data/sync', async (_req, res, next) => { try { const result = await gameDataService.syncFromRepository(); recordAdminLog('info', 'Game Data', `Synced ${result.synced} JSON files to Supabase`, 200); res.json(result); } catch (e) { recordAdminLog('error', 'Game Data', e.message, 500); next(e); } });
 app.get('/api/whitelists', async (req, res, next) => { try { res.json(await db.collection('whitelists').find({}, { orderBy: 'updated_at' })); } catch (e) { next(e); } });
 app.post('/api/whitelists', async (req, res, next) => { try { res.status(201).json(await db.collection('whitelists').insertOne(cleanWhitelist(req.body))); } catch (e) { next(e); } });
 app.patch('/api/whitelists/:id', async (req, res, next) => { try {
-  const changes = {}; const keys = ['steam_id','discord_id','player_name','status','notes','auth','session_token','profile','coin','amethyst','amulet','character_slot','role','ban_status','player_record','sticker_slot','inventory','immortal_data','is_online','last_online'];
+  const changes = {}; const keys = ['steam_id','discord_id','player_name','status','notes','auth','session_token','profile','coin','amethyst','amulet','character_slot','role','ban_status','player_record','sticker_slot','inventory','immortal_data','game_data','is_online','last_online'];
   for (const key of keys) if (Object.hasOwn(req.body, key)) changes[key] = req.body[key];
   if (Object.hasOwn(changes,'steam_id')) changes.steam_id = String(changes.steam_id || '').trim();
   for (const key of ['discord_id','player_name','notes','session_token','role']) if (Object.hasOwn(changes,key)) changes[key] = String(changes[key] || '').trim() || null;
@@ -123,7 +136,7 @@ app.post('/api/whitelists/sync-players', async (req, res, next) => { try {
   const { data: docs, error: docsError } = await supabase.from('admin_documents').select('data').eq('collection_id', req.body.collection_id); if (docsError) throw docsError;
   const { data: prior, error: priorError } = await supabase.from('whitelists').select('steam_id,status,notes'); if (priorError) throw priorError;
   const existing = new Map(prior.map(p => [p.steam_id, p]));
-  const rows = docs.map(({ data: p }) => { const steam_id = String(p.steamId || p.steam_id || (p.auth || []).find(a => a.authType === 'STEAM')?.extId || '').trim(); const old = existing.get(steam_id); return { steam_id, discord_id: (p.auth || []).find(a => /discord/i.test(a.authType || ''))?.extId || null, player_name: p.profile?.displayName || null, status: old?.status || 'pending', notes: old?.notes || null, auth: p.auth || [], session_token: p.session_token || null, profile: p.profile || {}, coin: p.coin || 0, amethyst: p.amethyst || 0, amulet: p.amulet || 0, character_slot: p.characterSlot ?? null, role: p.role || 'survivor', ban_status: p.banStatus ?? null, player_record: p.playerRecord ?? null, sticker_slot: p.stickerSlot ?? null, inventory: p.inventory ?? null, immortal_data: p.immortalData || [], is_online: Boolean(p.isOnline), last_online: p.lastOnline || null, updated_at: new Date().toISOString() }; }).filter(p => p.steam_id);
+  const rows = docs.map(({ data: p }) => { const steam_id = String(p.steamId || p.steam_id || (p.auth || []).find(a => a.authType === 'STEAM')?.extId || '').trim(); const old = existing.get(steam_id); const excluded = new Set(['steamId','steam_id','auth','session_token','profile','coin','amethyst','amulet','characterSlot','role','banStatus','playerRecord','stickerSlot','inventory','immortalData','isOnline','lastOnline']); const game_data = p.game_data && typeof p.game_data === 'object' ? p.game_data : Object.fromEntries(Object.entries(p).filter(([key]) => !excluded.has(key))); return { steam_id, discord_id: (p.auth || []).find(a => /discord/i.test(a.authType || ''))?.extId || null, player_name: p.profile?.displayName || null, status: old?.status || 'pending', notes: old?.notes || null, auth: p.auth || [], session_token: p.session_token || null, profile: p.profile || {}, coin: p.coin || 0, amethyst: p.amethyst || 0, amulet: p.amulet || 0, character_slot: p.characterSlot ?? null, role: p.role || 'survivor', ban_status: p.banStatus ?? null, player_record: p.playerRecord ?? null, sticker_slot: p.stickerSlot ?? null, inventory: p.inventory ?? null, immortal_data: p.immortalData || [], game_data, is_online: Boolean(p.isOnline), last_online: p.lastOnline || null, updated_at: new Date().toISOString() }; }).filter(p => p.steam_id);
   if (!rows.length) return res.json({ synced: 0 });
   const { data, error } = await supabase.from('whitelists').upsert(rows, { onConflict: 'steam_id' }).select('id'); if (error) throw error;
   res.json({ synced: data.length, scanned: docs.length });
@@ -154,6 +167,17 @@ app.post('/api/commands/kill-launchers', async (req, res, next) => { try { const
 // Launcher-facing read-only endpoint; share this URL with the launcher integration.
 app.get('/public/whitelist', async (req, res, next) => { try { const status = req.query.status || 'approved'; const rows = await db.collection('whitelists').find({ status }, { limit: 5000, orderBy: 'created_at', ascending: true }); res.set('Cache-Control', 'no-store').json({ updated_at: new Date().toISOString(), players: rows.map(({ steam_id, discord_id, player_name, status }) => ({ steam_id, discord_id, player_name, status })) }); } catch (e) { next(e); } });
 app.get('/public/servers', async (req, res, next) => { try { const cid = await coreCollectionId('serverinfo'); const { data, error } = await supabase.from('admin_documents').select('data').eq('collection_id', cid).order('created_at').limit(100); if (error) throw error; const rows = data.map(x => x.data).filter(x => x.is_online !== false && x.IsOnline !== false); res.set('Cache-Control', 'no-store').json(rows); } catch (e) { next(e); } });
+app.get('/public/game-data', async (req, res, next) => {
+  try {
+    if (req.query.path) {
+      const item = await gameDataService.get(req.query.path);
+      if (!item) return res.status(404).json({ error: 'Game data file not found' });
+      return res.set('Cache-Control', 'public, max-age=60').json(item.data);
+    }
+    const files = await gameDataService.list();
+    res.set('Cache-Control', 'no-store').json({ updated_at: new Date().toISOString(), files: files.map(({ file_path, sha256, updated_at }) => ({ path: file_path, sha256, updated_at })) });
+  } catch (e) { next(e); }
+});
 async function readGameServerInfo() {
   const cid = await coreCollectionId('serverinfo');
   const { data, error } = await supabase.from('admin_documents').select('data').eq('collection_id', cid).order('created_at').limit(100);
@@ -206,8 +230,7 @@ app.post('/live/player/authen', async (req, res) => {
     const steamId = String(steamPayload?.response?.params?.steamid || '');
     if (!/^\d{17}$/.test(steamId)) { recordAdminLog('warn', 'Steam Auth', 'Steam response did not contain a valid SteamID; ticket rejected', 401); return gameError(res, 401, 'Steam rejected the session ticket'); }
 
-    const { data: row, error: playerError } = await supabase.from('whitelists').select('*').eq('steam_id', steamId).maybeSingle();
-    if (playerError) throw playerError;
+    const row = await whitelistRepository.findBySteamId(steamId);
     if (!row) { recordAdminLog('warn', 'Steam Auth', 'Authenticated SteamID is absent from whitelist', 403); return gameError(res, 403, 'Steam account is not on the whitelist'); }
     if (row.status === 'banned' || isBanActive(row.ban_status)) { recordAdminLog('warn', 'Steam Auth', 'Whitelist rejected: player is banned', 403); return gameError(res, 403, 'Your account has been banned'); }
     if (row.status !== 'approved') { recordAdminLog('warn', 'Steam Auth', `Whitelist rejected: status is ${row.status}`, 403); return gameError(res, 403, 'Your whitelist is not approved'); }
@@ -223,11 +246,11 @@ app.post('/live/player/authen', async (req, res) => {
     const steamAuth = { ...(authEntries.find(item => item && String(item.authType).toUpperCase() === 'STEAM') || authTemplate.data.player.auth[0]), authType: 'STEAM', extId: steamId, authAt: now };
     const otherAuth = authEntries.filter(item => item && String(item.authType).toUpperCase() !== 'STEAM');
     const updatedAuth = [steamAuth, ...otherAuth];
-    const { data: saved, error: saveError } = await supabase.from('whitelists').update({ auth: updatedAuth, session_token: sessionToken, is_online: true, last_online: now, updated_at: now }).eq('id', row.id).select('*').single();
-    if (saveError) throw saveError;
+    const saved = await whitelistRepository.saveGameSession(row.id, { auth: updatedAuth, session_token: sessionToken, is_online: true, last_online: now });
 
     const response = structuredClone(authTemplate);
     const player = response.data.player;
+    Object.assign(player, saved.game_data || {});
     player._id = steamId;
     player.auth = updatedAuth;
     player.session_token = sessionToken;
@@ -305,10 +328,15 @@ app.get('/public/launcher-config', async (req, res) => {
     catch (error) { console.warn('[Discord] Could not load verify link:', error.message); }
   }
   const verifyServiceUrl = String(process.env.LAUNCHER_VERIFY_PUBLIC_URL || '').trim().replace(/\/+$/, '');
-  res.set('Cache-Control','no-store').json({ host: base, serverinfo_url: publishedServerInfoUrl(req), auth_url: `${base}/live/player/authen`, game_api_url: `${base}/live/player/gameplay/checkversion`, whitelist_url: `${base}/public/whitelist`, discord_verify_url, discord_login_url: verifyServiceUrl ? `${verifyServiceUrl}/oauth/launcher` : '' });
+  res.set('Cache-Control','no-store').json({ host: base, serverinfo_url: publishedServerInfoUrl(req), game_data_url: `${base}/public/game-data`, auth_url: `${base}/live/player/authen`, game_api_url: `${base}/live/player/gameplay/checkversion`, whitelist_url: `${base}/public/whitelist`, discord_verify_url, discord_login_url: verifyServiceUrl ? `${verifyServiceUrl}/oauth/launcher` : '' });
 });
+app.use('/', gameHealthRoutes);
+// The game API adapters in src use Supabase repositories and static JSON rows.
+// Existing auth/checkversion handlers above take precedence; remaining routes
+// are served by the adapted game API router.
+app.use('/', require('./src/routes/index'));
 app.use((err, req, res, next) => { console.error(err); res.status(400).json({ error: err.message || 'Request failed' }); });
-function cleanWhitelist(x = {}) { return { steam_id: String(x.steam_id || '').trim(), discord_id: String(x.discord_id || '').trim() || null, player_name: String(x.player_name || '').trim() || null, status: ['approved','pending','banned'].includes(x.status) ? x.status : 'pending', notes: String(x.notes || '').trim() || null, auth: x.auth || [], session_token: x.session_token || null, profile: x.profile || {}, coin: Number(x.coin) || 0, amethyst: Number(x.amethyst) || 0, amulet: Number(x.amulet) || 0, character_slot: x.character_slot ?? null, role: x.role || 'survivor', ban_status: x.ban_status ?? null, player_record: x.player_record ?? null, sticker_slot: x.sticker_slot ?? null, inventory: x.inventory ?? null, immortal_data: x.immortal_data || [], is_online: Boolean(x.is_online), last_online: x.last_online || null }; }
+function cleanWhitelist(x = {}) { return { steam_id: String(x.steam_id || '').trim(), discord_id: String(x.discord_id || '').trim() || null, player_name: String(x.player_name || '').trim() || null, status: ['approved','pending','banned'].includes(x.status) ? x.status : 'pending', notes: String(x.notes || '').trim() || null, auth: x.auth || [], session_token: x.session_token || null, profile: x.profile || {}, coin: Number(x.coin) || 0, amethyst: Number(x.amethyst) || 0, amulet: Number(x.amulet) || 0, character_slot: x.character_slot ?? null, role: x.role || 'survivor', ban_status: x.ban_status ?? null, player_record: x.player_record ?? null, sticker_slot: x.sticker_slot ?? null, inventory: x.inventory ?? null, immortal_data: x.immortal_data || [], game_data: x.game_data && typeof x.game_data === 'object' ? x.game_data : {}, is_online: Boolean(x.is_online), last_online: x.last_online || null }; }
 function cleanServer(x = {}) { return { room_name: String(x.room_name || '').trim(), host_ip: String(x.host_ip || '').trim(), port: Number(x.port) || 0, max_players: Number(x.max_players) || 0, is_online: Boolean(x.is_online), server_version: String(x.server_version || '').trim() || null, extra: x.extra && typeof x.extra === 'object' ? x.extra : {} }; }
 function readBoolean(value, fallback) { if (typeof value === 'boolean') return value; if (typeof value === 'string') { if (value.toLowerCase() === 'true') return true; if (value.toLowerCase() === 'false') return false; } return fallback; }
 function gameError(res, statusCode, message) { return res.status(statusCode).json({ status: 0, data: null, error: message }); }
