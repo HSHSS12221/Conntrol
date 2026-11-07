@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
+const authTemplate = require('./templates/auth.json');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
@@ -144,6 +145,71 @@ app.post('/api/commands/kill-launchers', async (req, res, next) => { try { const
 // Launcher-facing read-only endpoint; share this URL with the launcher integration.
 app.get('/public/whitelist', async (req, res, next) => { try { const status = req.query.status || 'approved'; const rows = await db.collection('whitelists').find({ status }, { limit: 5000, orderBy: 'created_at', ascending: true }); res.set('Cache-Control', 'no-store').json({ updated_at: new Date().toISOString(), players: rows.map(({ steam_id, discord_id, player_name, status }) => ({ steam_id, discord_id, player_name, status })) }); } catch (e) { next(e); } });
 app.get('/public/servers', async (req, res, next) => { try { const cid = await coreCollectionId('serverinfo'); const { data, error } = await supabase.from('admin_documents').select('data').eq('collection_id', cid).order('created_at').limit(100); if (error) throw error; const rows = data.map(x => x.data).filter(x => x.is_online !== false && x.IsOnline !== false); res.set('Cache-Control', 'no-store').json(rows); } catch (e) { next(e); } });
+app.post('/live/player/authen', async (req, res) => {
+  try {
+    if (String(req.body?.authType || '').toLowerCase() !== 'steam') return gameError(res, 400, 'Only Steam authentication is supported');
+    const ticket = String(req.body?.ticket || '').trim();
+    if (!/^(?:[a-f0-9]{2}){20,8192}$/i.test(ticket)) return gameError(res, 400, 'A valid Steam session ticket is required');
+
+    const publisherKey = String(process.env.STEAM_PUBLISHER_KEY || '').trim();
+    const appId = String(process.env.STEAM_APP_ID || '2334220').trim();
+    if (!publisherKey || !/^\d+$/.test(appId)) return gameError(res, 503, 'Steam ticket validation is not configured');
+    const steamUrl = new URL('https://partner.steam-api.com/ISteamUserAuth/AuthenticateUserTicket/v1/');
+    steamUrl.searchParams.set('key', publisherKey);
+    steamUrl.searchParams.set('appid', appId);
+    steamUrl.searchParams.set('ticket', ticket);
+    if (process.env.STEAM_TICKET_IDENTITY) steamUrl.searchParams.set('identity', process.env.STEAM_TICKET_IDENTITY);
+    const steamResponse = await fetch(steamUrl, { signal: AbortSignal.timeout(12000) });
+    const steamPayload = await steamResponse.json();
+    if (!steamResponse.ok) {
+      console.warn('[Steam Auth] Steam returned HTTP', steamResponse.status);
+      return gameError(res, 502, 'Steam authentication service is unavailable');
+    }
+    const steamId = String(steamPayload?.response?.params?.steamid || '');
+    if (!/^\d{17}$/.test(steamId)) return gameError(res, 401, 'Steam rejected the session ticket');
+
+    const { data: row, error: playerError } = await supabase.from('whitelists').select('*').eq('steam_id', steamId).maybeSingle();
+    if (playerError) throw playerError;
+    if (!row) return gameError(res, 403, 'Steam account is not on the whitelist');
+    if (row.status === 'banned' || isBanActive(row.ban_status)) return gameError(res, 403, 'Your account has been banned');
+    if (row.status !== 'approved') return gameError(res, 403, 'Your whitelist is not approved');
+
+    const now = new Date().toISOString();
+    const sessionToken = issueGameSessionToken(steamId);
+    const authEntries = Array.isArray(row.auth) ? [...row.auth] : structuredClone(authTemplate.data.player.auth || []);
+    const steamAuth = { ...(authEntries.find(item => item && String(item.authType).toUpperCase() === 'STEAM') || authTemplate.data.player.auth[0]), authType: 'STEAM', extId: steamId, authAt: now };
+    const otherAuth = authEntries.filter(item => item && String(item.authType).toUpperCase() !== 'STEAM');
+    const updatedAuth = [steamAuth, ...otherAuth];
+    const { data: saved, error: saveError } = await supabase.from('whitelists').update({ auth: updatedAuth, session_token: sessionToken, is_online: true, last_online: now, updated_at: now }).eq('id', row.id).select('*').single();
+    if (saveError) throw saveError;
+
+    const { serverInfo } = await readGameServerInfo();
+    const response = structuredClone(authTemplate);
+    const player = response.data.player;
+    player._id = steamId;
+    player.auth = updatedAuth;
+    player.session_token = sessionToken;
+    player.profile = { ...player.profile, ...(saved.profile || {}), displayName: saved.player_name || saved.profile?.displayName || `Player_${steamId.slice(-6)}`, updatedAt: now };
+    player.characterSlot = saved.character_slot || player.characterSlot;
+    player.role = saved.role || player.role;
+    player.stickerSlot = saved.sticker_slot || player.stickerSlot;
+    player.inventory = toLegacyInventory(saved.inventory, player.inventory);
+    player.coin = saved.coin ?? player.coin;
+    player.amethyst = saved.amethyst ?? player.amethyst;
+    player.amulet = saved.amulet ?? player.amulet;
+    player.banStatus = saved.ban_status || player.banStatus;
+    player.playerRecord = saved.player_record || player.playerRecord;
+    player.isOnline = true;
+    player.lastOnline = now;
+    response.data.session_token = sessionToken;
+    response.data.serverInfo = serverInfo;
+    response.error = null;
+    res.status(200).json(response);
+  } catch (error) {
+    console.error('[Steam Auth]', error.message);
+    gameError(res, 503, 'Steam authentication could not be completed');
+  }
+});
 app.get('/live/player/gameplay/checkversion', async (_req, res) => { try {
   const cid = await coreCollectionId('serverinfo');
   const { data, error } = await supabase.from('admin_documents').select('data').eq('collection_id', cid).order('created_at').limit(100);
@@ -195,12 +261,32 @@ app.get('/public/launcher-config', async (req, res) => {
     catch (error) { console.warn('[Discord] Could not load verify link:', error.message); }
   }
   const verifyServiceUrl = String(process.env.LAUNCHER_VERIFY_PUBLIC_URL || '').trim().replace(/\/+$/, '');
-  res.set('Cache-Control','no-store').json({ host: base, serverinfo_url: publishedServerInfoUrl(req), game_api_url: `${base}/live/player/gameplay/checkversion`, whitelist_url: `${base}/public/whitelist`, discord_verify_url, discord_login_url: verifyServiceUrl ? `${verifyServiceUrl}/oauth/launcher` : '' });
+  res.set('Cache-Control','no-store').json({ host: base, serverinfo_url: publishedServerInfoUrl(req), auth_url: `${base}/live/player/authen`, game_api_url: `${base}/live/player/gameplay/checkversion`, whitelist_url: `${base}/public/whitelist`, discord_verify_url, discord_login_url: verifyServiceUrl ? `${verifyServiceUrl}/oauth/launcher` : '' });
 });
 app.use((err, req, res, next) => { console.error(err); res.status(400).json({ error: err.message || 'Request failed' }); });
 function cleanWhitelist(x = {}) { return { steam_id: String(x.steam_id || '').trim(), discord_id: String(x.discord_id || '').trim() || null, player_name: String(x.player_name || '').trim() || null, status: ['approved','pending','banned'].includes(x.status) ? x.status : 'pending', notes: String(x.notes || '').trim() || null, auth: x.auth || [], session_token: x.session_token || null, profile: x.profile || {}, coin: Number(x.coin) || 0, amethyst: Number(x.amethyst) || 0, amulet: Number(x.amulet) || 0, character_slot: x.character_slot ?? null, role: x.role || 'survivor', ban_status: x.ban_status ?? null, player_record: x.player_record ?? null, sticker_slot: x.sticker_slot ?? null, inventory: x.inventory ?? null, immortal_data: x.immortal_data || [], is_online: Boolean(x.is_online), last_online: x.last_online || null }; }
 function cleanServer(x = {}) { return { room_name: String(x.room_name || '').trim(), host_ip: String(x.host_ip || '').trim(), port: Number(x.port) || 0, max_players: Number(x.max_players) || 0, is_online: Boolean(x.is_online), server_version: String(x.server_version || '').trim() || null, extra: x.extra && typeof x.extra === 'object' ? x.extra : {} }; }
 function readBoolean(value, fallback) { if (typeof value === 'boolean') return value; if (typeof value === 'string') { if (value.toLowerCase() === 'true') return true; if (value.toLowerCase() === 'false') return false; } return fallback; }
+function gameError(res, statusCode, message) { return res.status(statusCode).json({ status: 0, data: null, error: message }); }
+function isBanActive(ban) { if (!ban || typeof ban !== 'object') return false; return !!ban.permanentBanned || !!(ban.bannedUntil && new Date(ban.bannedUntil) > new Date()); }
+function issueGameSessionToken(steamId) {
+  const secret = String(process.env.GAME_SESSION_SECRET || '').trim();
+  if (!secret) throw new Error('GAME_SESSION_SECRET is not configured');
+  const b64 = value => Buffer.from(value).toString('base64url');
+  const now = Math.floor(Date.now() / 1000);
+  const unsigned = `${b64(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64(JSON.stringify({ steamId, type: 'session', iat: now, exp: now + 86400 }))}`;
+  return `${unsigned}.${crypto.createHmac('sha256', secret).update(unsigned).digest('base64url')}`;
+}
+function toLegacyInventory(inventory, fallback) {
+  if (!inventory || typeof inventory !== 'object') return fallback;
+  if (inventory.inventory && typeof inventory.inventory === 'object') return inventory;
+  const converted = { inventory: {} };
+  for (const key of ['characters','skins','perks','profiles','stickers','heads','backs','costumes','rituals','cosmeticconsume','bundles','poses','effects']) {
+    for (const item of Array.isArray(inventory[key]) ? inventory[key] : []) if (item && item !== 'None') converted.inventory[item] = 1;
+  }
+  if (Array.isArray(inventory.items) && Array.isArray(inventory.itemCounts)) inventory.items.forEach((item, index) => { if (item) converted.inventory[item] = inventory.itemCounts[index] || 1; });
+  return converted;
+}
 function safeName(value) { const name = String(value || '').trim(); if (!/^[a-zA-Z][a-zA-Z0-9_-]{1,39}$/.test(name)) throw new Error('ใช้ชื่อ 2-40 ตัวอักษร เริ่มด้วย a-z และใช้ได้เฉพาะตัวเลข _ -'); return name; }
 function signLauncherClient(clientId) { return crypto.createHmac('sha256', LAUNCHER_TOKEN).update(`launcher-client-v1:${clientId}`).digest('hex'); }
 function verifyLauncherClient(clientId, authorization) { if (!LAUNCHER_TOKEN || !authorization?.startsWith('Bearer ')) return false; const supplied = Buffer.from(authorization.slice(7), 'hex'); const expected = Buffer.from(signLauncherClient(clientId), 'hex'); return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected); }
