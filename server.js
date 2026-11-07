@@ -178,10 +178,18 @@ app.post('/live/player/authen', async (req, res) => {
     steamUrl.searchParams.set('ticket', ticket);
     if (process.env.STEAM_TICKET_IDENTITY) steamUrl.searchParams.set('identity', process.env.STEAM_TICKET_IDENTITY);
     const steamResponse = await fetch(steamUrl, { signal: AbortSignal.timeout(12000) });
-    const steamPayload = await steamResponse.json();
+    const steamBody = await steamResponse.text();
+    const steamContentType = steamResponse.headers.get('content-type') || 'unknown';
     if (!steamResponse.ok) {
-      console.warn('[Steam Auth] Steam returned HTTP', steamResponse.status);
-      return gameError(res, 502, 'Steam authentication service is unavailable');
+      // Do not log the request URL; it contains the private API key and ticket.
+      console.warn('[Steam Auth] Steam returned HTTP', steamResponse.status, 'content-type:', steamContentType);
+      return gameError(res, 502, `Steam authentication service returned HTTP ${steamResponse.status}`);
+    }
+    let steamPayload;
+    try { steamPayload = JSON.parse(steamBody); }
+    catch {
+      console.warn('[Steam Auth] Steam returned non-JSON response; content-type:', steamContentType);
+      return gameError(res, 502, 'Steam authentication service returned an invalid response');
     }
     const steamId = String(steamPayload?.response?.params?.steamid || '');
     if (!/^\d{17}$/.test(steamId)) return gameError(res, 401, 'Steam rejected the session ticket');
