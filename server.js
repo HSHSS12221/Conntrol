@@ -43,7 +43,7 @@ app.use((req, res, next) => {
   res.once('finish', () => recordAdminLog(
     res.statusCode >= 400 ? 'warn' : 'info',
     'Game API',
-    `${req.method} ${requestPath} -> HTTP ${res.statusCode} (${Date.now() - startedAt}ms)`,
+    `${req.method} ${requestPath} -> HTTP ${res.statusCode} (${Date.now() - startedAt}ms)${requestPath.toLowerCase() === '/live/player/characterslot/edit' ? `; fields=${Object.keys(req.body && typeof req.body === 'object' ? req.body : {}).filter(key => !/token|ticket|secret|key/i.test(key)).slice(0, 20).join(',') || '(none)'}` : ''}`,
     res.statusCode
   ));
   next();
