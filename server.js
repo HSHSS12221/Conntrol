@@ -16,6 +16,7 @@ const gameHealthRoutes = require('./src/Health');
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 const adminLogs = [];
 function recordAdminLog(level, source, message, status = null) {
@@ -211,11 +212,22 @@ async function readGameServerInfo() {
     IsDevOnline: readBoolean(info.IsDevOnline ?? info.is_dev_online, false)
   } };
 }
+app.get('/live/player/authen', (_req, res) => gameError(res, 405, 'Steam authentication requires a POST request from the game'));
 app.post('/live/player/authen', async (req, res) => {
   recordAdminLog('info', 'Steam Auth', 'Received POST /live/player/authen');
   try {
-    if (String(req.body?.authType || '').toLowerCase() !== 'steam') { recordAdminLog('warn', 'Steam Auth', 'Rejected request: authType is not steam', 400); return gameError(res, 400, 'Only Steam authentication is supported'); }
-    const ticket = String(req.body?.ticket || '').trim();
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const normalizedKeys = Object.fromEntries(Object.keys(body).map(key => [key.replace(/[^a-z0-9]/gi, '').toLowerCase(), key]));
+    const authTypeKey = normalizedKeys.authtype;
+    const authType = authTypeKey ? body[authTypeKey] : '';
+    if (String(authType || '').toLowerCase() !== 'steam') {
+      const safeType = typeof authType === 'string' || typeof authType === 'number' ? String(authType).slice(0, 32) : typeof authType;
+      const fieldNames = Object.keys(body).slice(0, 20).join(',') || '(none)';
+      recordAdminLog('warn', 'Steam Auth', `Rejected request: expected authType=steam; received ${safeType}; content-type=${String(req.get('content-type') || 'missing').slice(0, 80)}; fields=${fieldNames}`, 400);
+      return gameError(res, 400, 'Only Steam authentication is supported');
+    }
+    const ticketKey = normalizedKeys.ticket || normalizedKeys.steamticket || normalizedKeys.sessionticket;
+    const ticket = String(ticketKey ? body[ticketKey] || '' : '').trim();
     if (!/^(?:[a-f0-9]{2}){20,8192}$/i.test(ticket)) { recordAdminLog('warn', 'Steam Auth', 'Rejected request: Steam ticket missing or malformed', 400); return gameError(res, 400, 'A valid Steam session ticket is required'); }
 
     const steamApiKey = String(process.env.STEAM_WEB_API_KEY || process.env.STEAM_PUBLISHER_KEY || '').trim();
