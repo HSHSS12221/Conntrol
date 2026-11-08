@@ -128,6 +128,19 @@ create table if not exists public.admin_documents (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+-- Server-side configuration shared with the Launcher. Never expose this table through the anon key.
+create table if not exists public.app_settings (
+  key text primary key,
+  value jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+alter table public.app_settings enable row level security;
+revoke all on public.app_settings from anon, authenticated;
+grant all on public.app_settings to service_role;
+-- Private bucket: Admin uploads releases; public manifest endpoint issues short-lived signed URLs.
+insert into storage.buckets(id, name, public, file_size_limit, allowed_mime_types)
+values ('launcher-updates', 'launcher-updates', false, 104857600, array['application/zip'])
+on conflict (id) do update set public = false, file_size_limit = 104857600, allowed_mime_types = array['application/zip'];
 -- Repository game JSON definitions stored in Supabase and served to the game/launcher.
 create table if not exists public.game_static_data (
   file_path text primary key check (file_path like 'static/%.json'),
