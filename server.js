@@ -15,6 +15,19 @@ const gameHealthRoutes = require('./src/Health');
 
 const app = express();
 app.set('trust proxy', 1);
+// Some game/proxy clients append the JSON content type twice. Express will
+// otherwise treat `application/json, application/json` as an unknown media
+// type and leave req.body empty, which prevents Steam auth and game saves.
+app.use((req, _res, next) => {
+  const contentType = req.headers['content-type'];
+  if (typeof contentType === 'string' && contentType.includes(',')) {
+    const values = contentType.split(',').map(value => value.split(';', 1)[0].trim().toLowerCase());
+    if (values.length > 1 && values.every(value => value === 'application/json')) {
+      req.headers['content-type'] = 'application/json';
+    }
+  }
+  next();
+});
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
