@@ -360,7 +360,16 @@ app.post('/live/player/authen', async (req, res) => {
       return gameError(res, 502, 'Steam authentication service returned an invalid response');
     }
     const steamId = String(steamPayload?.response?.params?.steamid || '');
-    if (!/^\d{17}$/.test(steamId)) { recordAdminLog('warn', 'Steam Auth', 'Steam response did not contain a valid SteamID; ticket rejected', 401); return gameError(res, 401, 'Steam rejected the session ticket'); }
+    if (!/^\d{17}$/.test(steamId)) {
+      const steamParams = steamPayload?.response?.params && typeof steamPayload.response.params === 'object' ? steamPayload.response.params : {};
+      const steamError = steamPayload?.response?.error && typeof steamPayload.response.error === 'object' ? steamPayload.response.error : {};
+      const safeValue = value => String(value ?? 'unknown').replace(/[^a-zA-Z0-9_. -]/g, '').slice(0, 48) || 'unknown';
+      const result = safeValue(steamParams.result ?? steamParams.resultcode);
+      const errorCode = safeValue(steamError.errorcode ?? steamPayload?.error?.errorcode);
+      const responseFields = Object.keys(steamParams).slice(0, 12).join(',') || '(none)';
+      recordAdminLog('warn', 'Steam Auth', `Steam rejected ticket; result=${result}; error_code=${errorCode}; response_fields=${responseFields}`, 401);
+      return gameError(res, 401, 'Steam rejected the session ticket');
+    }
 
     const row = await whitelistRepository.findBySteamId(steamId);
     if (!row) { recordAdminLog('warn', 'Steam Auth', 'Authenticated SteamID is absent from whitelist', 403); return gameError(res, 403, 'Steam account is not on the whitelist'); }
