@@ -184,7 +184,7 @@ app.put('/api/launcher-update', express.raw({ type: 'application/zip', limit: '1
 // Public game-download files are uploaded directly from the browser to Storage
 // with a short-lived, path-scoped TUS token; large binaries never pass through Render.
 const GAME_DOWNLOAD_BUCKET = 'game-downloads';
-const GAME_DOWNLOAD_MAX_BYTES = Math.max(1, Number(process.env.GAME_DOWNLOAD_MAX_BYTES) || 29 * 1024 ** 3);
+const GAME_DOWNLOAD_MAX_BYTES = Math.max(1, Number(process.env.GAME_DOWNLOAD_MAX_BYTES) || 40 * 1024 ** 3);
 async function ensureGameDownloadBucket() {
   const { data: buckets, error } = await supabase.storage.listBuckets();
   if (error) throw error;
