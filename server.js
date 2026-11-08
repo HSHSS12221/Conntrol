@@ -406,7 +406,6 @@ async function sendDiscordApprovalDM(discordId) {
 
 require('module-alias/register');
 require('dotenv').config();
-const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
 const authTemplate = require('./templates/auth.json');
