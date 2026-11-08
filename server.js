@@ -49,7 +49,7 @@ app.use((req, res, next) => {
   next();
 });
 
-const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_SECRET_KEY, ADMIN_TOKEN, LAUNCHER_TOKEN } = process.env;
+const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_SECRET_KEY, SUPABASE_ANON_KEY, ADMIN_TOKEN, LAUNCHER_TOKEN } = process.env;
 function publicBaseUrl(req) { return (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, ''); }
 function publishedServerInfoUrl(req, base = publicBaseUrl(req)) { return `${base}/public/servers`; }
 function normalizeHostUrl(value) {
@@ -225,6 +225,7 @@ app.get('/api/game-downloads', async (_req, res, next) => {
 });
 app.post('/api/game-downloads/upload', async (req, res, next) => {
   try {
+    if (!SUPABASE_ANON_KEY) return res.status(503).json({ error: 'ตั้งค่า SUPABASE_ANON_KEY ใน Render Environment ก่อนอัปโหลด (ใช้ publishable/anon key ห้ามใช้ service-role key)' });
     const name = safeGameDownloadName(req.body?.name);
     const size = Number(req.body?.size);
     if (!Number.isSafeInteger(size) || size <= 0 || size > GAME_DOWNLOAD_MAX_BYTES) return res.status(400).json({ error: `ไฟล์ต้องมีขนาดไม่เกิน ${(GAME_DOWNLOAD_MAX_BYTES / 1024 ** 3).toFixed(1)} GB` });
@@ -236,7 +237,9 @@ app.post('/api/game-downloads/upload', async (req, res, next) => {
     const storageOrigin = supabaseUrl.hostname.endsWith('.supabase.co')
       ? `https://${supabaseUrl.hostname.replace(/\.supabase\.co$/i, '.storage.supabase.co')}`
       : supabaseUrl.origin;
-    res.status(201).json({ path: objectPath, token: data.token, bucket: GAME_DOWNLOAD_BUCKET, storage_origin: storageOrigin, max_file_bytes: GAME_DOWNLOAD_MAX_BYTES });
+    // TUS signed uploads use the dedicated `/sign` endpoint. The anon/publishable
+    // key is safe to send to the browser; never return the service-role key here.
+    res.status(201).json({ path: objectPath, token: data.token, bucket: GAME_DOWNLOAD_BUCKET, storage_origin: storageOrigin, apikey: SUPABASE_ANON_KEY || null, max_file_bytes: GAME_DOWNLOAD_MAX_BYTES });
   } catch (error) { next(error); }
 });
 app.delete('/api/game-downloads', async (req, res, next) => {
