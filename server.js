@@ -38,7 +38,22 @@ app.use((req, res, next) => {
 
 const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_SECRET_KEY, ADMIN_TOKEN, LAUNCHER_TOKEN } = process.env;
 function publicBaseUrl(req) { return (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, ''); }
-function publishedServerInfoUrl(req) { return `${publicBaseUrl(req)}/public/servers`; }
+function publishedServerInfoUrl(req, base = publicBaseUrl(req)) { return `${base}/public/servers`; }
+function normalizeHostUrl(value) {
+  const parsed = new URL(String(value || '').trim());
+  if (!['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash || (parsed.pathname !== '/' && parsed.pathname !== '')) throw new Error('Host ต้องเป็น URL ต้นทาง เช่น https://example.onrender.com โดยไม่มี path');
+  if (parsed.protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(parsed.hostname)) throw new Error('Host ที่เผยแพร่ต้องใช้ HTTPS');
+  return parsed.origin;
+}
+async function launcherBaseUrl(req) {
+  if (supabase) {
+    const { data, error } = await supabase.from('app_settings').select('value').eq('key', 'launcher_host_url').maybeSingle();
+    if (error && error.code !== 'PGRST205' && error.code !== '42P01') throw error;
+    const saved = typeof data?.value === 'string' ? data.value : data?.value?.url;
+    if (saved) return normalizeHostUrl(saved);
+  }
+  return normalizeHostUrl(publicBaseUrl(req));
+}
 // Prefer Supabase's current server-only secret key; keep the legacy variable for existing deployments.
 const supabaseServerKey = SUPABASE_SECRET_KEY || SUPABASE_SERVICE_ROLE_KEY;
 const supabase = SUPABASE_URL && supabaseServerKey
@@ -102,18 +117,57 @@ app.get('/launcher/bootstrap', async (req, res, next) => {
       fetchAllRows(() => supabase.from('admin_documents').select('data').eq('collection_id', serverInfoCollectionId).order('created_at')),
       fetchAllRows(() => supabase.from('whitelists').select('*').order('created_at'))
     ]);
-    const base = publicBaseUrl(req);
+    const base = await launcherBaseUrl(req);
     const players = playerRows.map(({ auth, session_token, notes, ...player }) => player);
     res.set('Cache-Control', 'no-store').json({
       updated_at: new Date().toISOString(),
       host: base,
-      urls: { serverinfo: publishedServerInfoUrl(req), whitelist: `${base}/public/whitelist` },
+      urls: { serverinfo: publishedServerInfoUrl(req, base), whitelist: `${base}/public/whitelist` },
       serverinfo: serverRows.map(row => row.data),
       players
     });
   } catch (e) { next(e); }
 });
 app.get('/api/health', (req, res) => res.json({ ok: true }));
+app.get('/api/settings/launcher-host', async (req, res, next) => {
+  try { res.json({ host: await launcherBaseUrl(req) }); } catch (e) { next(e); }
+});
+app.put('/api/settings/launcher-host', async (req, res, next) => {
+  try {
+    const host = normalizeHostUrl(req.body.host);
+    const { error } = await supabase.from('app_settings').upsert({ key: 'launcher_host_url', value: { url: host }, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    if (error) throw error;
+    recordAdminLog('info', 'Launcher Config', `Launcher Host updated to ${host}`, 200);
+    res.set('Cache-Control', 'no-store').json({ host });
+  } catch (e) { if (e instanceof TypeError || e instanceof Error && /Host/.test(e.message)) return res.status(400).json({ error: e.message || 'Invalid Host URL' }); next(e); }
+});
+app.get('/api/launcher-update', async (_req, res, next) => {
+  try {
+    const { data, error } = await supabase.from('app_settings').select('value,updated_at').eq('key', 'launcher_update_manifest').maybeSingle();
+    if (error) throw error;
+    res.set('Cache-Control', 'no-store').json({ available: Boolean(data?.value?.version), version: data?.value?.version || null, notes: data?.value?.notes || '', updated_at: data?.updated_at || null });
+  } catch (e) { next(e); }
+});
+app.put('/api/launcher-update', express.raw({ type: 'application/zip', limit: '100mb' }), async (req, res, next) => {
+  try {
+    if (!Buffer.isBuffer(req.body) || req.body.length < 4 || req.body[0] !== 0x50 || req.body[1] !== 0x4b) return res.status(400).json({ error: 'กรุณาเลือกไฟล์ ZIP ของ Launcher' });
+    const version = String(req.query.version || '').trim();
+    const notes = String(req.query.notes || '').trim().slice(0, 2000);
+    if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) return res.status(400).json({ error: 'Version ต้องเป็นรูปแบบเช่น 1.2.3' });
+    const { data: currentRow, error: currentError } = await supabase.from('app_settings').select('value').eq('key', 'launcher_update_manifest').maybeSingle();
+    if (currentError) throw currentError;
+    if (currentRow?.value?.version && compareLauncherVersions(version, currentRow.value.version) <= 0) return res.status(400).json({ error: `Version ใหม่ต้องมากกว่า ${currentRow.value.version}` });
+    const sha256 = crypto.createHash('sha256').update(req.body).digest('hex');
+    const objectPath = `releases/${version}.zip`;
+    const { error: uploadError } = await supabase.storage.from('launcher-updates').upload(objectPath, req.body, { contentType: 'application/zip', upsert: true, cacheControl: '0' });
+    if (uploadError) throw uploadError;
+    const manifest = { version, object_path: objectPath, sha256, notes, published_at: new Date().toISOString() };
+    const { error: saveError } = await supabase.from('app_settings').upsert({ key: 'launcher_update_manifest', value: manifest, updated_at: manifest.published_at }, { onConflict: 'key' });
+    if (saveError) throw saveError;
+    recordAdminLog('info', 'Launcher Update', `Published Launcher ${version} (${req.body.length} bytes, SHA-256 ${sha256})`, 200);
+    res.status(201).json({ version, sha256, bytes: req.body.length });
+  } catch (e) { recordAdminLog('error', 'Launcher Update', e.message, 500); next(e); }
+});
 app.get('/api/game-data', async (_req, res, next) => { try { res.set('Cache-Control', 'no-store').json(await gameDataService.list()); } catch (e) { next(e); } });
 app.get('/api/game-data/file', async (req, res) => { try { const item = await gameDataService.get(req.query.path); if (!item) return res.status(404).json({ error: 'Game data file has not been synced to Supabase' }); res.set('Cache-Control', 'no-store').json(item); } catch (e) { res.status(400).json({ error: e.message }); } });
 app.post('/api/game-data/sync', async (_req, res, next) => { try { const result = await gameDataService.syncFromRepository(); recordAdminLog('info', 'Game Data', `Synced ${result.synced} JSON files to Supabase`, 200); res.json(result); } catch (e) { recordAdminLog('error', 'Game Data', e.message, 500); next(e); } });
@@ -349,7 +403,8 @@ app.post('/live/player/gameplay/checkversion', async (req, res, next) => { try {
   res.json({ status: 1, data: { serverInfo }, error: null });
 } catch (e) { console.error('[Game API checkversion]', e); res.status(503).json({ status: 0, data: null, error: 'Could not load ServerInfo from Supabase' }); } });
 app.get('/public/launcher-config', async (req, res) => {
-  const base = publicBaseUrl(req);
+  let base;
+  try { base = await launcherBaseUrl(req); } catch (error) { console.error('[Launcher Config]', error.message); return res.status(503).json({ error: 'Could not load Launcher Host setting' }); }
   let discord_verify_url = '';
   const botUrl = String(process.env.DISCORD_BOT_API_URL || '').trim().replace(/\/+$/, '');
   if (botUrl) {
@@ -357,7 +412,19 @@ app.get('/public/launcher-config', async (req, res) => {
     catch (error) { console.warn('[Discord] Could not load verify link:', error.message); }
   }
   const verifyServiceUrl = String(process.env.LAUNCHER_VERIFY_PUBLIC_URL || '').trim().replace(/\/+$/, '');
-  res.set('Cache-Control','no-store').json({ host: base, serverinfo_url: publishedServerInfoUrl(req), game_data_url: `${base}/public/game-data`, auth_url: `${base}/live/player/authen`, game_api_url: `${base}/live/player/gameplay/checkversion`, whitelist_url: `${base}/public/whitelist`, discord_verify_url, discord_login_url: verifyServiceUrl ? `${verifyServiceUrl}/oauth/launcher` : '' });
+  res.set('Cache-Control','no-store').json({ host: base, serverinfo_url: publishedServerInfoUrl(req, base), game_data_url: `${base}/public/game-data`, auth_url: `${base}/live/player/authen`, game_api_url: `${base}/live/player/gameplay/checkversion`, whitelist_url: `${base}/public/whitelist`, discord_verify_url, discord_login_url: verifyServiceUrl ? `${verifyServiceUrl}/oauth/launcher` : '' });
+});
+app.get('/public/launcher-update', async (_req, res, next) => {
+  if (!supabase) return res.status(503).json({ error: 'Supabase is not configured' });
+  try {
+    const { data, error } = await supabase.from('app_settings').select('value').eq('key', 'launcher_update_manifest').maybeSingle();
+    if (error) throw error;
+    const manifest = data?.value;
+    if (!manifest?.version || !manifest?.object_path || !manifest?.sha256) return res.status(204).end();
+    const { data: signed, error: signError } = await supabase.storage.from('launcher-updates').createSignedUrl(manifest.object_path, 600);
+    if (signError) throw signError;
+    res.set('Cache-Control', 'no-store').json({ version: manifest.version, url: signed.signedUrl, sha256: manifest.sha256, notes: manifest.notes || '', published_at: manifest.published_at || null });
+  } catch (e) { next(e); }
 });
 app.use('/', gameHealthRoutes);
 // The game API adapters in src use Supabase repositories and static JSON rows.
@@ -372,6 +439,7 @@ app.use(['/live', '/logapi'], (req, res) => {
 });
 app.use((err, req, res, next) => { console.error(err); res.status(400).json({ error: err.message || 'Request failed' }); });
 function cleanWhitelist(x = {}) { return { steam_id: String(x.steam_id || '').trim(), discord_id: String(x.discord_id || '').trim() || null, player_name: String(x.player_name || '').trim() || null, status: ['approved','pending','banned'].includes(x.status) ? x.status : 'pending', notes: String(x.notes || '').trim() || null, auth: x.auth || [], session_token: x.session_token || null, profile: x.profile || {}, coin: Number(x.coin) || 0, amethyst: Number(x.amethyst) || 0, amulet: Number(x.amulet) || 0, character_slot: x.character_slot ?? null, role: x.role || 'survivor', ban_status: x.ban_status ?? null, player_record: x.player_record ?? null, sticker_slot: x.sticker_slot ?? null, inventory: x.inventory ?? null, immortal_data: x.immortal_data || [], game_data: x.game_data && typeof x.game_data === 'object' ? x.game_data : {}, is_online: Boolean(x.is_online), last_online: x.last_online || null }; }
+function compareLauncherVersions(a, b) { const parts = value => String(value).match(/^\d+\.\d+\.\d+/)[0].split('.').map(Number); const left = parts(a), right = parts(b); for (let i = 0; i < 3; i++) if (left[i] !== right[i]) return left[i] - right[i]; return 0; }
 function cleanServer(x = {}) { return { room_name: String(x.room_name || '').trim(), host_ip: String(x.host_ip || '').trim(), port: Number(x.port) || 0, max_players: Number(x.max_players) || 0, is_online: Boolean(x.is_online), server_version: String(x.server_version || '').trim() || null, extra: x.extra && typeof x.extra === 'object' ? x.extra : {} }; }
 function readBoolean(value, fallback) { if (typeof value === 'boolean') return value; if (typeof value === 'string') { if (value.toLowerCase() === 'true') return true; if (value.toLowerCase() === 'false') return false; } return fallback; }
 function gameError(res, statusCode, message) { return res.status(statusCode).json({ status: 0, data: null, error: message }); }
