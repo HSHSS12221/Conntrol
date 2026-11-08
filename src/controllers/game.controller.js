@@ -80,3 +80,15 @@ exports.getBan = async (req, res) => {
     return sendError(res, 500, 'Internal server error');
   }
 };
+
+exports.getPlayerStats = async (req, res) => {
+  try {
+    // Always use the account resolved from the signed session token. Never
+    // select a player from a client-supplied Steam ID for this private data.
+    if (!req.player) return sendError(res, 401, 'Unauthorized - Invalid session');
+    return sendSuccess(res, gameService.getPlayerStats(req.player));
+  } catch (error) {
+    console.error('Get player stats error:', error);
+    return sendError(res, 500, 'Internal server error');
+  }
+};
