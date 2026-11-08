@@ -181,6 +181,74 @@ app.put('/api/launcher-update', express.raw({ type: 'application/zip', limit: '1
     res.status(201).json({ version, sha256, bytes: req.body.length });
   } catch (e) { recordAdminLog('error', 'Launcher Update', e.message, 500); next(e); }
 });
+// Public game-download files are uploaded directly from the browser to Storage
+// with a short-lived, path-scoped TUS token; large binaries never pass through Render.
+const GAME_DOWNLOAD_BUCKET = 'game-downloads';
+const GAME_DOWNLOAD_MAX_BYTES = Math.max(1, Number(process.env.GAME_DOWNLOAD_MAX_BYTES) || 29 * 1024 ** 3);
+async function ensureGameDownloadBucket() {
+  const { data: buckets, error } = await supabase.storage.listBuckets();
+  if (error) throw error;
+  const bucket = (buckets || []).find(item => item.name === GAME_DOWNLOAD_BUCKET);
+  if (!bucket) {
+    const { error: createError } = await supabase.storage.createBucket(GAME_DOWNLOAD_BUCKET, { public: true });
+    if (createError) throw createError;
+  } else if (!bucket.public) {
+    const { error: updateError } = await supabase.storage.updateBucket(GAME_DOWNLOAD_BUCKET, { public: true });
+    if (updateError) throw updateError;
+  }
+}
+function safeGameDownloadName(value) {
+  const base = String(value || '').replace(/\\/g, '/').split('/').pop() || '';
+  return base.normalize('NFKC').replace(/[^\w\-.() \u0E00-\u0E7F]/g, '_').replace(/\s+/g, '_').slice(0, 140) || 'game-download.zip';
+}
+function gameDownloadPublicUrl(objectPath) {
+  const { data } = supabase.storage.from(GAME_DOWNLOAD_BUCKET).getPublicUrl(objectPath, { download: true });
+  return data.publicUrl;
+}
+app.get('/api/game-downloads', async (_req, res, next) => {
+  try {
+    await ensureGameDownloadBucket();
+    const rows = [];
+    for (let offset = 0; offset < 2000; offset += 100) {
+      const { data, error } = await supabase.storage.from(GAME_DOWNLOAD_BUCKET).list('games', { limit: 100, offset, sortBy: { column: 'created_at', order: 'desc' } });
+      if (error) throw error;
+      rows.push(...data.filter(item => item.name && !item.id?.endsWith('/')));
+      if (data.length < 100) break;
+    }
+    const files = rows.map(item => {
+      const objectPath = `games/${item.name}`;
+      const splitAt = item.name.indexOf('__');
+      return { path: objectPath, name: splitAt >= 0 ? item.name.slice(splitAt + 2) : item.name, size: Number(item.metadata?.size) || 0, created_at: item.created_at || null, url: gameDownloadPublicUrl(objectPath) };
+    });
+    res.set('Cache-Control', 'no-store').json({ files, max_file_bytes: GAME_DOWNLOAD_MAX_BYTES, used_bytes: files.reduce((sum, file) => sum + file.size, 0) });
+  } catch (error) { next(error); }
+});
+app.post('/api/game-downloads/upload', async (req, res, next) => {
+  try {
+    const name = safeGameDownloadName(req.body?.name);
+    const size = Number(req.body?.size);
+    if (!Number.isSafeInteger(size) || size <= 0 || size > GAME_DOWNLOAD_MAX_BYTES) return res.status(400).json({ error: `ไฟล์ต้องมีขนาดไม่เกิน ${(GAME_DOWNLOAD_MAX_BYTES / 1024 ** 3).toFixed(1)} GB` });
+    await ensureGameDownloadBucket();
+    const objectPath = `games/${crypto.randomUUID()}__${name}`;
+    const { data, error } = await supabase.storage.from(GAME_DOWNLOAD_BUCKET).createSignedUploadUrl(objectPath, { upsert: false });
+    if (error) throw error;
+    const supabaseUrl = new URL(SUPABASE_URL);
+    const storageOrigin = supabaseUrl.hostname.endsWith('.supabase.co')
+      ? `https://${supabaseUrl.hostname.replace(/\.supabase\.co$/i, '.storage.supabase.co')}`
+      : supabaseUrl.origin;
+    res.status(201).json({ path: objectPath, token: data.token, bucket: GAME_DOWNLOAD_BUCKET, storage_origin: storageOrigin, max_file_bytes: GAME_DOWNLOAD_MAX_BYTES });
+  } catch (error) { next(error); }
+});
+app.delete('/api/game-downloads', async (req, res, next) => {
+  try {
+    const objectPath = String(req.body?.path || '');
+    if (!/^games\/[0-9a-f-]{36}__[\w\-.() \u0E00-\u0E7F]{1,140}$/i.test(objectPath)) return res.status(400).json({ error: 'Invalid game download path' });
+    const { error } = await supabase.storage.from(GAME_DOWNLOAD_BUCKET).remove([objectPath]);
+    if (error) throw error;
+    recordAdminLog('info', 'Game Downloads', `Deleted ${objectPath.slice(0, 170)}`, 200);
+    res.json({ deleted: true });
+  } catch (error) { next(error); }
+});
 app.get('/api/game-data', async (_req, res, next) => { try { res.set('Cache-Control', 'no-store').json(await gameDataService.list()); } catch (e) { next(e); } });
 app.get('/api/game-data/file', async (req, res) => { try { const item = await gameDataService.get(req.query.path); if (!item) return res.status(404).json({ error: 'Game data file has not been synced to Supabase' }); res.set('Cache-Control', 'no-store').json(item); } catch (e) { res.status(400).json({ error: e.message }); } });
 app.post('/api/game-data/sync', async (_req, res, next) => { try { const result = await gameDataService.syncFromRepository(); recordAdminLog('info', 'Game Data', `Synced ${result.synced} JSON files to Supabase`, 200); res.json(result); } catch (e) { recordAdminLog('error', 'Game Data', e.message, 500); next(e); } });
@@ -490,6 +558,22 @@ app.use('/', gameHealthRoutes);
 // Existing auth/checkversion handlers above take precedence; remaining routes
 // are served by the adapted game API router.
 app.use('/', require('./src/routes/index'));
+// The client posts gameplay diagnostics here. Keep the report useful without
+// persisting request bodies wholesale (they may contain session credentials).
+app.post('/logapi/v1/add/errorlog', (req, res) => {
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+  const safeText = value => String(value ?? '')
+    .replace(/(ticket|session[_-]?token|access[_-]?token|secret|api[_-]?key)\s*[:=]\s*[^\s,;]+/ig, '$1=[redacted]')
+    .replace(/\b(?:[a-f0-9]{40,}|eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,})\b/g, '[redacted]')
+    .replace(/[\r\n\t]+/g, ' ')
+    .slice(0, 180);
+  const details = Object.entries(body)
+    .filter(([key, value]) => !/ticket|token|secret|key|steamid|discordid|authorization/i.test(key) && ['string', 'number', 'boolean'].includes(typeof value))
+    .slice(0, 5)
+    .map(([key, value]) => `${safeText(key)}=${safeText(value)}`);
+  recordAdminLog('warn', 'Game Error', details.length ? details.join('; ') : `Received client error report; fields=${Object.keys(body).filter(key => !/ticket|token|secret|key|steamid|discordid|authorization/i.test(key)).slice(0, 12).join(',') || '(none)'}`, 200);
+  res.status(200).json({ status: 'success' });
+});
 // Keep unknown game routes machine-readable and visible in Admin → System Logs.
 app.use(['/live', '/logapi'], (req, res) => {
   const path = req.originalUrl.split('?')[0];
