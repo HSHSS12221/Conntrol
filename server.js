@@ -171,6 +171,43 @@ app.put('/api/launcher-update', express.raw({ type: 'application/zip', limit: '1
 app.get('/api/game-data', async (_req, res, next) => { try { res.set('Cache-Control', 'no-store').json(await gameDataService.list()); } catch (e) { next(e); } });
 app.get('/api/game-data/file', async (req, res) => { try { const item = await gameDataService.get(req.query.path); if (!item) return res.status(404).json({ error: 'Game data file has not been synced to Supabase' }); res.set('Cache-Control', 'no-store').json(item); } catch (e) { res.status(400).json({ error: e.message }); } });
 app.post('/api/game-data/sync', async (_req, res, next) => { try { const result = await gameDataService.syncFromRepository(); recordAdminLog('info', 'Game Data', `Synced ${result.synced} JSON files to Supabase`, 200); res.json(result); } catch (e) { recordAdminLog('error', 'Game Data', e.message, 500); next(e); } });
+// Admin player-save tools. Game credentials and session tokens are deliberately excluded.
+app.get('/api/player-saves', async (_req, res, next) => {
+  try {
+    const { data, error } = await supabase.from('whitelists').select(PLAYER_SAVE_SELECT).order('updated_at', { ascending: false }).limit(5000);
+    if (error) throw error;
+    res.set('Cache-Control', 'no-store').json(data.map(row => ({ ...row, save_data: playerSaveDocument(row) })));
+  } catch (e) { next(e); }
+});
+app.post('/api/player-saves', async (req, res, next) => {
+  try {
+    const steamId = String(req.body.steam_id || '').trim();
+    if (!/^\d{17}$/.test(steamId)) return res.status(400).json({ error: 'Steam ID ต้องเป็น SteamID64 17 หลัก' });
+    const { data: existing, error: lookupError } = await supabase.from('whitelists').select('id').eq('steam_id', steamId).maybeSingle();
+    if (lookupError) throw lookupError;
+    if (existing) return res.status(409).json({ error: 'มี Save Data ของ Steam ID นี้แล้ว' });
+    const template = await playerDataService.loadPlayerTemplate();
+    const saveData = req.body.save_data === undefined ? template : req.body.save_data;
+    const split = splitPlayerSave(saveData);
+    const { data, error } = await supabase.from('whitelists').insert({
+      steam_id: steamId, player_name: String(req.body.player_name || saveData.profile?.displayName || '').trim() || null,
+      discord_id: null, status: 'pending', notes: null, auth: [], session_token: null,
+      ...split, updated_at: new Date().toISOString()
+    }).select(PLAYER_SAVE_SELECT).single();
+    if (error) throw error;
+    recordAdminLog('info', 'Player Save', `Created save data for SteamID ${steamId}`, 201);
+    res.status(201).json({ ...data, save_data: playerSaveDocument(data) });
+  } catch (e) { next(e); }
+});
+app.put('/api/player-saves/:id', async (req, res, next) => {
+  try {
+    const split = splitPlayerSave(req.body.save_data);
+    const { data, error } = await supabase.from('whitelists').update({ ...split, updated_at: new Date().toISOString() }).eq('id', req.params.id).select(PLAYER_SAVE_SELECT).single();
+    if (error) throw error;
+    recordAdminLog('info', 'Player Save', `Saved game data for SteamID ${data.steam_id}`, 200);
+    res.set('Cache-Control', 'no-store').json({ ...data, save_data: playerSaveDocument(data) });
+  } catch (e) { if (e.message === 'Save Data ต้องเป็น JSON object' || e.message === 'Save Data ใหญ่เกิน 900 KB') return res.status(400).json({ error: e.message }); next(e); }
+});
 app.get('/api/whitelists', async (req, res, next) => { try { res.json(await db.collection('whitelists').find({}, { orderBy: 'updated_at' })); } catch (e) { next(e); } });
 app.post('/api/whitelists', async (req, res, next) => { try { res.status(201).json(await db.collection('whitelists').insertOne(cleanWhitelist(req.body))); } catch (e) { next(e); } });
 app.patch('/api/whitelists/:id', async (req, res, next) => { try {
@@ -438,6 +475,44 @@ app.use(['/live', '/logapi'], (req, res) => {
   gameError(res, 404, `Game API endpoint is not implemented: ${req.method} ${path}`);
 });
 app.use((err, req, res, next) => { console.error(err); res.status(400).json({ error: err.message || 'Request failed' }); });
+const PLAYER_SAVE_SELECT = 'id,steam_id,discord_id,player_name,status,profile,coin,amethyst,amulet,character_slot,role,ban_status,player_record,sticker_slot,inventory,immortal_data,game_data,is_online,last_online,created_at,updated_at';
+const PLAYER_SAVE_FIELDS = [
+  ['profile','profile'],['coin','coin'],['amethyst','amethyst'],['amulet','amulet'],
+  ['characterSlot','character_slot','character_slot'],['role','role'],['banStatus','ban_status','ban_status'],
+  ['playerRecord','player_record','player_record'],['stickerSlot','sticker_slot','sticker_slot'],
+  ['inventory','inventory'],['immortalData','immortal_data','immortal_data'],['isOnline','is_online','is_online'],['lastOnline','last_online','last_online']
+];
+const PLAYER_SAVE_PRIVATE_KEYS = new Set(['steamId','steam_id','_id','id','auth','session_token','sessionToken','player_name','discord_id','status','notes','createdAt','updatedAt','_exists']);
+function playerSaveDocument(row) {
+  const document = row.game_data && typeof row.game_data === 'object' && !Array.isArray(row.game_data) ? { ...row.game_data } : {};
+  for (const key of PLAYER_SAVE_PRIVATE_KEYS) delete document[key];
+  for (const [key, column, alias] of PLAYER_SAVE_FIELDS) {
+    if (row[column] !== undefined) document[key] = row[column];
+  }
+  return document;
+}
+function splitPlayerSave(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Save Data ต้องเป็น JSON object');
+  if (Buffer.byteLength(JSON.stringify(value), 'utf8') > 900 * 1024) throw new Error('Save Data ใหญ่เกิน 900 KB');
+  const gameData = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (PLAYER_SAVE_PRIVATE_KEYS.has(key)) continue;
+    const mapping = PLAYER_SAVE_FIELDS.find(([name, , alias]) => key === name || (alias && key === alias));
+    if (!mapping) gameData[key] = entry;
+  }
+  const result = { game_data: gameData };
+  for (const [key, column, alias] of PLAYER_SAVE_FIELDS) {
+    const inputKey = Object.hasOwn(value, key) ? key : alias && Object.hasOwn(value, alias) ? alias : null;
+    if (!inputKey) continue;
+    let entry = value[inputKey];
+    if (['coin','amethyst','amulet'].includes(key)) { entry = Number(entry); if (!Number.isFinite(entry)) throw new Error(`${key} ต้องเป็นตัวเลข`); }
+    if (key === 'role' && typeof entry !== 'string') throw new Error('role ต้องเป็นข้อความ');
+    if (key === 'profile' && (!entry || typeof entry !== 'object' || Array.isArray(entry))) throw new Error('profile ต้องเป็น JSON object');
+    if (key === 'isOnline') entry = entry === true || entry === 'true';
+    result[column] = entry;
+  }
+  return result;
+}
 function cleanWhitelist(x = {}) { return { steam_id: String(x.steam_id || '').trim(), discord_id: String(x.discord_id || '').trim() || null, player_name: String(x.player_name || '').trim() || null, status: ['approved','pending','banned'].includes(x.status) ? x.status : 'pending', notes: String(x.notes || '').trim() || null, auth: x.auth || [], session_token: x.session_token || null, profile: x.profile || {}, coin: Number(x.coin) || 0, amethyst: Number(x.amethyst) || 0, amulet: Number(x.amulet) || 0, character_slot: x.character_slot ?? null, role: x.role || 'survivor', ban_status: x.ban_status ?? null, player_record: x.player_record ?? null, sticker_slot: x.sticker_slot ?? null, inventory: x.inventory ?? null, immortal_data: x.immortal_data || [], game_data: x.game_data && typeof x.game_data === 'object' ? x.game_data : {}, is_online: Boolean(x.is_online), last_online: x.last_online || null }; }
 function compareLauncherVersions(a, b) { const parts = value => String(value).match(/^\d+\.\d+\.\d+/)[0].split('.').map(Number); const left = parts(a), right = parts(b); for (let i = 0; i < 3; i++) if (left[i] !== right[i]) return left[i] - right[i]; return 0; }
 function cleanServer(x = {}) { return { room_name: String(x.room_name || '').trim(), host_ip: String(x.host_ip || '').trim(), port: Number(x.port) || 0, max_players: Number(x.max_players) || 0, is_online: Boolean(x.is_online), server_version: String(x.server_version || '').trim() || null, extra: x.extra && typeof x.extra === 'object' ? x.extra : {} }; }
