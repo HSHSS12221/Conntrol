@@ -243,7 +243,19 @@ class PlayerDataService {
         for (const [key, value] of Object.entries(template)) {
           if (!reserved.has(key) && existingPlayer[key] === undefined) existingPlayer[key] = value;
         }
-        existingPlayer.characterSlot = existingPlayer.characterSlot || characterSlot;
+        const currentSlots = existingPlayer.characterSlot && typeof existingPlayer.characterSlot === 'object'
+          ? existingPlayer.characterSlot
+          : {};
+        existingPlayer.characterSlot = {
+          ...structuredClone(characterSlot),
+          ...currentSlots,
+          hunterSlot: Array.isArray(currentSlots.hunterSlot) && currentSlots.hunterSlot.length
+            ? currentSlots.hunterSlot : structuredClone(characterSlot.hunterSlot || []),
+          survivorSlot: Array.isArray(currentSlots.survivorSlot) && currentSlots.survivorSlot.length
+            ? currentSlots.survivorSlot : structuredClone(characterSlot.survivorSlot || []),
+          characterhunteritem: currentSlots.characterhunteritem || characterSlot.characterhunteritem,
+          characteritem: currentSlots.characteritem || characterSlot.characteritem,
+        };
         existingPlayer.inventory = existingPlayer.inventory || inventory;
         if (isFreshWhitelistRow) {
           Object.assign(existingPlayer, DEFAULT_PLAYER_CURRENCIES);
@@ -255,6 +267,24 @@ class PlayerDataService {
           existingPlayer.immortalData = existingPlayer.immortalData?.length ? existingPlayer.immortalData : (template.immortalData || []);
         }
         existingPlayer.__player_template_version = 1;
+        await existingPlayer.save();
+      }
+      const slots = existingPlayer.characterSlot && typeof existingPlayer.characterSlot === 'object'
+        ? existingPlayer.characterSlot : {};
+      const hasLoadouts = (Array.isArray(slots.hunterSlot) && slots.hunterSlot.length > 0)
+        || (Array.isArray(slots.survivorSlot) && slots.survivorSlot.length > 0);
+      if (!hasLoadouts) {
+        const template = await this.loadPlayerTemplate();
+        existingPlayer.characterSlot = {
+          ...structuredClone(template.characterSlot || {}),
+          ...slots,
+          hunterSlot: Array.isArray(slots.hunterSlot) && slots.hunterSlot.length
+            ? slots.hunterSlot : structuredClone(template.characterSlot?.hunterSlot || []),
+          survivorSlot: Array.isArray(slots.survivorSlot) && slots.survivorSlot.length
+            ? slots.survivorSlot : structuredClone(template.characterSlot?.survivorSlot || []),
+          characterhunteritem: slots.characterhunteritem || template.characterSlot?.characterhunteritem,
+          characteritem: slots.characteritem || template.characterSlot?.characteritem,
+        };
         await existingPlayer.save();
       }
       await this.grantAllItemsAndSetCurrency(existingPlayer);
