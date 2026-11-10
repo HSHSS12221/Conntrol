@@ -871,7 +871,57 @@ function verifyLauncherClient(clientId, authorization) { if (!LAUNCHER_TOKEN || 
 async function fetchAllRows(buildQuery, pageSize = 1000) { const rows = []; for (let offset = 0; ; offset += pageSize) { const { data, error } = await buildQuery().range(offset, offset + pageSize - 1); if (error) throw error; rows.push(...data); if (data.length < pageSize) return rows; } }
 async function coreCollectionId(name) { const { data: dbRow, error: dbError } = await supabase.from('admin_databases').select('id').eq('name','HSHO-PrivateServer').single(); if (dbError) throw dbError; const { data: row, error } = await supabase.from('admin_collections').select('id').eq('database_id',dbRow.id).eq('name',name).single(); if (error) throw error; return row.id; }
 const port = Number(process.env.PORT) || 3000;
-app.listen(port, () => console.log(`HSH admin listening on ${port}`));
+const GAME_BOOTSTRAP_STATIC_FILES = [
+  'static/player/PlayerTemplate.json',
+  'static/player/immortal.json',
+  'static/player/curserelic.json',
+  'static/store/P_List.json',
+  'static/store/I_List.json',
+  'static/store/S_List.json',
+  'static/store/taglist/C_Survivor.json',
+  'static/store/taglist/P_Survivor.json',
+  'static/store/taglist/Effect_Hunter.json',
+  'static/store/taglist/P_Hunter.json',
+  'static/store/taglist/C_Hunter.json',
+  'static/inventory/Characters.json',
+  'static/inventory/Skins.json',
+  'static/inventory/Perks.json',
+  'static/inventory/Profile.json',
+  'static/inventory/Stickers.json',
+  'static/inventory/Heads.json',
+  'static/inventory/Backs.json',
+  'static/inventory/Bundles.json',
+  'static/inventory/Poses.json',
+  'static/inventory/SummonEffect.json',
+  'static/inventory/Rituals.json',
+  'static/inventory/Items.json',
+  'static/inventory/K_Cosmetic.json',
+  'static/inventory/S_Cosmetic.json',
+  'static/pots/greedy.json',
+  'static/pots/bullet.json',
+  'static/bonus/api/get_bonus_data.json',
+  'static/exprk/table.json',
+];
+
+async function startServer() {
+  if (gameDataService) {
+    try {
+      const warmResult = await Promise.race([
+        gameDataService.warm(GAME_BOOTSTRAP_STATIC_FILES),
+        new Promise(resolve => setTimeout(() => resolve({ timedOut: true }), 8000)),
+      ]);
+      if (warmResult.timedOut) {
+        recordAdminLog('warn', 'Game Data', 'Static data prewarm exceeded 8 seconds; game routes will warm files on demand');
+      } else {
+        recordAdminLog('info', 'Game Data', `Preloaded ${warmResult.warmed} static files in one query; missing=${warmResult.missing.length}`, 200);
+      }
+    } catch (error) {
+      recordAdminLog('warn', 'Game Data', `Static data prewarm failed; routes will warm files on demand: ${error.message}`);
+    }
+  }
+  app.listen(port, () => console.log(`HSH admin listening on ${port}`));
+}
+startServer();
 async function sendDiscordApprovalDM(discordId) {
   const baseUrl = String(process.env.DISCORD_BOT_API_URL || '').trim().replace(/\/+$/, '');
   const secret = process.env.DISCORD_BOT_WEBHOOK_SECRET || '';
