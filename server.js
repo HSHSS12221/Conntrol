@@ -480,11 +480,11 @@ app.post('/live/player/authen', async (req, res) => {
     player.role = playerData.role || saved.role || player.role;
     player.stickerSlot = playerData.stickerSlot || saved.sticker_slot || player.stickerSlot;
     player.inventory = toLegacyInventory(playerData.inventory || saved.inventory, player.inventory);
-    // This private-server configuration grants 6,000 of each currency. Treat
-    // zero-valued legacy rows as not initialized so auth cannot send 0 back.
-    player.coin = Number(playerData.coin ?? saved.coin) || 6000;
-    player.amethyst = Number(playerData.amethyst ?? saved.amethyst) || 6000;
-    player.amulet = Number(playerData.amulet ?? saved.amulet) || 6000;
+    // Currency defaults are seeded and persisted once by PlayerDataService.
+    // Do not turn a legitimate saved zero into 6,000 in the response.
+    player.coin = Number(playerData.coin ?? saved.coin ?? 0);
+    player.amethyst = Number(playerData.amethyst ?? saved.amethyst ?? 0);
+    player.amulet = Number(playerData.amulet ?? saved.amulet ?? 0);
     player.banStatus = playerData.banStatus || saved.ban_status || player.banStatus;
     player.playerRecord = playerData.playerRecord || saved.player_record || player.playerRecord;
     player.isOnline = true;
