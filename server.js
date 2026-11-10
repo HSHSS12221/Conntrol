@@ -43,7 +43,7 @@ app.use((req, res, next) => {
   res.once('finish', () => recordAdminLog(
     res.statusCode >= 400 ? 'warn' : 'info',
     'Game API',
-    `${req.method} ${requestPath} -> HTTP ${res.statusCode} (${Date.now() - startedAt}ms)${requestPath.toLowerCase() === '/live/player/characterslot/edit' ? `; fields=${Object.keys(req.body && typeof req.body === 'object' ? req.body : {}).filter(key => !/token|ticket|secret|key/i.test(key)).slice(0, 20).join(',') || '(none)'}` : ''}`,
+    `${req.method} ${requestPath} -> HTTP ${res.statusCode} (${Date.now() - startedAt}ms)${requestPath.toLowerCase() === '/live/player/characterslot/edit' ? `; fields=${listSafeGameFieldNames(req.body).join(',') || '(none)'}` : ''}`,
     res.statusCode
   ));
   next();
@@ -389,25 +389,27 @@ async function readGameServerInfo() {
 }
 app.get('/live/player/authen', (_req, res) => gameError(res, 405, 'Steam authentication requires a POST request from the game'));
 app.post('/live/player/authen', async (req, res) => {
-  recordAdminLog('info', 'Steam Auth', 'Received POST /live/player/authen');
+  const requestFields = listSafeGameFieldNames(req.body);
+  recordAdminLog('info', 'Steam Auth', `Received POST /live/player/authen; fields=${requestFields.join(',') || '(none)'}`);
   try {
     const body = req.body && typeof req.body === 'object' ? req.body : {};
-    const normalizedKeys = Object.fromEntries(Object.keys(body).map(key => [key.replace(/[^a-z0-9]/gi, '').toLowerCase(), key]));
-    const authTypeKey = normalizedKeys.authtype;
-    const authType = authTypeKey ? body[authTypeKey] : '';
+    const authType = findGameAuthField(body, ['authType','auth_type','platform','provider']);
     if (String(authType || '').toLowerCase() !== 'steam') {
       const safeType = typeof authType === 'string' || typeof authType === 'number' ? String(authType).slice(0, 32) : typeof authType;
-      const fieldNames = Object.keys(body).slice(0, 20).join(',') || '(none)';
-      recordAdminLog('warn', 'Steam Auth', `Rejected request: expected authType=steam; received ${safeType}; content-type=${String(req.get('content-type') || 'missing').slice(0, 80)}; fields=${fieldNames}`, 400);
+      recordAdminLog('warn', 'Steam Auth', `Rejected request: expected authType=steam; received ${safeType}; content-type=${String(req.get('content-type') || 'missing').slice(0, 80)}; fields=${requestFields.join(',') || '(none)'}`, 400);
       return gameError(res, 400, 'Only Steam authentication is supported');
     }
-    const ticketKey = normalizedKeys.ticket || normalizedKeys.steamticket || normalizedKeys.sessionticket;
-    const ticket = String(ticketKey ? body[ticketKey] || '' : '').trim();
+    const ticketValue = findGameAuthField(body, ['ticket','steamTicket','sessionTicket','authTicket','steamSessionTicket','hexTicket']);
+    const ticket = String(ticketValue || '').trim();
     if (!/^(?:[a-f0-9]{2}){20,8192}$/i.test(ticket)) { recordAdminLog('warn', 'Steam Auth', 'Rejected request: Steam ticket missing or malformed', 400); return gameError(res, 400, 'A valid Steam session ticket is required'); }
 
-    const steamApiKey = String(process.env.STEAM_WEB_API_KEY || process.env.STEAM_PUBLISHER_KEY || '').trim();
+    const webApiKey = String(process.env.STEAM_WEB_API_KEY || '').trim();
+    const publisherKey = String(process.env.STEAM_PUBLISHER_KEY || '').trim();
+    const steamApiKey = webApiKey || publisherKey;
+    // This game uses Steam App ID 480; allow Render to override it if needed.
     const appId = String(process.env.STEAM_APP_ID || '480').trim();
-    const steamHost = String(process.env.STEAM_API_HOST || 'api.steampowered.com').trim().toLowerCase();
+    const defaultSteamHost = publisherKey && !webApiKey ? 'partner.steam-api.com' : 'api.steampowered.com';
+    const steamHost = String(process.env.STEAM_API_HOST || defaultSteamHost).trim().toLowerCase();
     if (!steamApiKey || !/^\d+$/.test(appId) || !['api.steampowered.com', 'partner.steam-api.com'].includes(steamHost)) { recordAdminLog('error', 'Steam Auth', 'Steam ticket validation environment is incomplete or invalid', 503); return gameError(res, 503, 'Steam ticket validation is not configured'); }
     const steamUrl = new URL(`https://${steamHost}/ISteamUserAuth/AuthenticateUserTicket/v1/`);
     steamUrl.searchParams.set('key', steamApiKey);
@@ -577,6 +579,67 @@ app.post('/logapi/v1/add/errorlog', (req, res) => {
   recordAdminLog('warn', 'Game Error', details.length ? details.join('; ') : `Received client error report; fields=${Object.keys(body).filter(key => !/ticket|token|secret|key|steamid|discordid|authorization/i.test(key)).slice(0, 12).join(',') || '(none)'}`, 200);
   res.status(200).json({ status: 'success' });
 });
+async function respondWithAuthedGamePlayer(req, res, action) {
+  const token = String(req.headers.authorization?.replace(/^Bearer\s+/i, '') || req.headers['x-access-token'] || findGameAuthField(req.body, ['session_token','sessionToken']) || '').trim();
+  const steamId = verifyGameSessionToken(token);
+  if (!steamId) { gameError(res, 401, 'A valid player session is required'); return; }
+  const player = await PlayerModel.findOne({ steamId });
+  if (!player || player.session_token !== token) { gameError(res, 401, 'Player session is expired or replaced'); return; }
+  if (player.status !== 'approved' || player.status === 'banned' || isBanActive(player.banStatus)) { gameError(res, 403, 'Player is not allowed to use this endpoint'); return; }
+  await action(player);
+}
+function safeGameSnapshot(value, depth = 0) {
+  if (depth > 8) return null;
+  if (value === null || ['string','number','boolean'].includes(typeof value)) return value;
+  if (Array.isArray(value)) return value.slice(0, 500).map(item => safeGameSnapshot(item, depth + 1));
+  if (!value || typeof value !== 'object') return null;
+  const result = {};
+  for (const [key, item] of Object.entries(value).slice(0, 300)) {
+    if (/ticket|session[_-]?token|access[_-]?token|secret|api[_-]?key|authorization/i.test(key)) continue;
+    result[key] = safeGameSnapshot(item, depth + 1);
+  }
+  return result;
+}
+app.post('/live/mailbox/get', async (req, res) => {
+  try {
+    await respondWithAuthedGamePlayer(req, res, async player => {
+      const mailbox = Array.isArray(player.mailbox) ? player.mailbox : [];
+      res.set('Cache-Control', 'no-store').json({ status: 1, data: { mails: mailbox }, error: null });
+    });
+  } catch (error) { console.error('[Mailbox]', error.message); gameError(res, 503, 'Mailbox data could not be loaded'); }
+});
+app.post('/live/treasure/api/progress/get', async (req, res) => {
+  try {
+    await respondWithAuthedGamePlayer(req, res, async player => {
+      const progress = player.treasureProgress && typeof player.treasureProgress === 'object' ? player.treasureProgress : {};
+      res.set('Cache-Control', 'no-store').json({ status: 1, data: { progress }, error: null });
+    });
+  } catch (error) { console.error('[Treasure Progress]', error.message); gameError(res, 503, 'Treasure progress could not be loaded'); }
+});
+app.post('/live/player/gameplay/endgameresult', async (req, res) => {
+  try {
+    await respondWithAuthedGamePlayer(req, res, async player => {
+      const snapshot = safeGameSnapshot(req.body);
+      if (Buffer.byteLength(JSON.stringify(snapshot), 'utf8') > 128 * 1024) return gameError(res, 413, 'Game result payload is too large');
+      player.lastGameResult = snapshot;
+      player.lastGameResultAt = new Date().toISOString();
+      await player.save();
+      recordAdminLog('info', 'Player Save', 'Authenticated end game result saved to that player record', 200);
+      res.json({ status: 1, data: { message: 'result saved' }, error: null });
+    });
+  } catch (error) { console.error('[End Game Result]', error.message); gameError(res, 503, 'Game result could not be saved'); }
+});
+app.post('/live/exprk/api/table', async (_req, res) => {
+  try {
+    const item = await gameDataService.get('static/exprk/table.json');
+    res.set('Cache-Control', 'no-store').json({ status: 1, data: item?.data ?? { table: [] }, error: null });
+  } catch (error) { console.error('[EXPRK Table]', error.message); gameError(res, 503, 'EXPRK table data could not be loaded'); }
+});
+app.post('/logapi/v1/add/ingame', (req, res) => {
+  const fields = listSafeGameFieldNames(req.body);
+  recordAdminLog('info', 'Game Client', `Received in-game log event; fields=${fields.join(',') || '(none)'}`, 200);
+  res.status(200).json({ status: 'success' });
+});
 // Keep unknown game routes machine-readable and visible in Admin → System Logs.
 app.use(['/live', '/logapi'], (req, res) => {
   const path = req.originalUrl.split('?')[0];
@@ -627,6 +690,37 @@ function compareLauncherVersions(a, b) { const parts = value => String(value).ma
 function cleanServer(x = {}) { return { room_name: String(x.room_name || '').trim(), host_ip: String(x.host_ip || '').trim(), port: Number(x.port) || 0, max_players: Number(x.max_players) || 0, is_online: Boolean(x.is_online), server_version: String(x.server_version || '').trim() || null, extra: x.extra && typeof x.extra === 'object' ? x.extra : {} }; }
 function readBoolean(value, fallback) { if (typeof value === 'boolean') return value; if (typeof value === 'string') { if (value.toLowerCase() === 'true') return true; if (value.toLowerCase() === 'false') return false; } return fallback; }
 function gameError(res, statusCode, message) { return res.status(statusCode).json({ status: 0, data: null, error: message }); }
+function normalizeGameFieldName(value) { return String(value).replace(/[^a-z0-9]/gi, '').toLowerCase(); }
+function findGameAuthField(root, names, depth = 0) {
+  if (depth > 4 || !root || typeof root !== 'object') return undefined;
+  if (Array.isArray(root)) {
+    for (const item of root) {
+      const found = findGameAuthField(item, names, depth + 1);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+  const wanted = new Set(names.map(normalizeGameFieldName));
+  for (const [key, value] of Object.entries(root)) if (wanted.has(normalizeGameFieldName(key))) return value;
+  for (const [key, value] of Object.entries(root)) {
+    if (['data','auth','payload','request','player'].includes(normalizeGameFieldName(key))) {
+      const found = findGameAuthField(value, names, depth + 1);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
+}
+function listSafeGameFieldNames(root, depth = 0) {
+  if (depth > 4 || !root || typeof root !== 'object') return [];
+  if (Array.isArray(root)) return root.flatMap(item => listSafeGameFieldNames(item, depth + 1)).slice(0, 30);
+  const names = [];
+  for (const [key, value] of Object.entries(root)) {
+    const safeKey = String(key).replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 40);
+    if (safeKey && !/ticket|token|secret|key|authorization/i.test(safeKey)) names.push(safeKey);
+    if (value && typeof value === 'object') names.push(...listSafeGameFieldNames(value, depth + 1));
+  }
+  return [...new Set(names)].slice(0, 30);
+}
 function isBanActive(ban) { if (!ban || typeof ban !== 'object') return false; return !!ban.permanentBanned || !!(ban.bannedUntil && new Date(ban.bannedUntil) > new Date()); }
 function issueGameSessionToken(steamId) {
   const secret = String(process.env.GAME_SESSION_SECRET || '').trim();
@@ -635,6 +729,22 @@ function issueGameSessionToken(steamId) {
   const now = Math.floor(Date.now() / 1000);
   const unsigned = `${b64(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64(JSON.stringify({ steamId, type: 'session', iat: now, exp: now + 86400 }))}`;
   return `${unsigned}.${crypto.createHmac('sha256', secret).update(unsigned).digest('base64url')}`;
+}
+function verifyGameSessionToken(token) {
+  const secret = String(process.env.GAME_SESSION_SECRET || '').trim();
+  if (!secret || typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const unsigned = `${parts[0]}.${parts[1]}`;
+  const expected = Buffer.from(crypto.createHmac('sha256', secret).update(unsigned).digest('base64url'));
+  const actual = Buffer.from(parts[2]);
+  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) return null;
+  try {
+    const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    if (header.alg !== 'HS256' || claims.type !== 'session' || !/^\d{17}$/.test(String(claims.steamId || '')) || Number(claims.exp) <= Math.floor(Date.now() / 1000)) return null;
+    return String(claims.steamId);
+  } catch { return null; }
 }
 function toLegacyInventory(inventory, fallback) {
   if (!inventory || typeof inventory !== 'object') return fallback;
