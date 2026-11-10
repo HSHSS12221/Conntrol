@@ -596,6 +596,73 @@ async function respondWithAuthedGamePlayer(req, res, action) {
   if (player.status !== 'approved' || player.status === 'banned' || isBanActive(player.banStatus)) { gameError(res, 403, 'Player is not allowed to use this endpoint'); return; }
   await action(player);
 }
+// Authenticated Save Data API. The SteamID always comes from the validated
+// session; callers cannot read or overwrite another player's row by changing
+// a request-body SteamID. Currency, inventory, whitelist, ban, and session
+// fields remain server-managed and are never accepted as save mutations.
+app.post('/api/getPlayerData', async (req, res) => {
+  try {
+    await respondWithAuthedGamePlayer(req, res, async player => {
+      const row = await whitelistRepository.findBySteamId(player.steamId);
+      if (!row) return res.status(404).json({ success: false, error: 'Player save not found' });
+      const data = playerSaveDocument(row);
+      data.steamid = player.steamId;
+      res.set('Cache-Control', 'no-store').json({ success: true, data });
+    });
+  } catch (error) {
+    console.error('[Player Save] getPlayerData:', error.message);
+    res.status(503).json({ success: false, error: 'Player data could not be loaded' });
+  }
+});
+app.post('/api/savePlayerData', async (req, res) => {
+  try {
+    await respondWithAuthedGamePlayer(req, res, async player => {
+      const payload = req.body?.playerData ?? req.body?.data;
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        return res.status(400).json({ success: false, error: 'playerData must be a JSON object' });
+      }
+      let split;
+      try { split = splitPlayerSave(payload); }
+      catch (error) { return res.status(400).json({ success: false, error: error.message }); }
+
+      const mutableColumns = new Set(['profile','character_slot','sticker_slot','player_record','immortal_data']);
+      const updates = {};
+      for (const [column, value] of Object.entries(split)) {
+        if (mutableColumns.has(column)) updates[column] = value;
+      }
+
+      if (Object.hasOwn(updates, 'character_slot')) {
+        const slotData = updates.character_slot;
+        delete updates.character_slot;
+        await inventoryService.updateCharacterSlot(player, slotData);
+      }
+      if (Object.hasOwn(updates, 'profile')) player.profile = { ...(player.profile || {}), ...updates.profile };
+      if (Object.hasOwn(updates, 'sticker_slot')) player.stickerSlot = updates.sticker_slot;
+      if (Object.hasOwn(updates, 'player_record')) player.playerRecord = updates.player_record;
+      if (Object.hasOwn(updates, 'immortal_data')) player.immortalData = updates.immortal_data;
+      if (Object.keys(updates).length) await player.save();
+
+      // Store additional non-reserved game fields in JSONB, without allowing
+      // callers to smuggle identity, credentials, economy, or moderation fields.
+      const protectedKeys = /^(steam_?id|auth|session_?token|access_?token|status|ban_?status|inventory|coin|amethyst|amulet|role|is_?online|last_?online)$/i;
+      const extras = Object.fromEntries(Object.entries(split.game_data || {}).filter(([key]) => !protectedKeys.test(key)));
+      if (Object.keys(extras).length) {
+        for (const [key, value] of Object.entries(extras)) player[key] = value;
+        await player.save();
+      }
+
+      const savedRow = await whitelistRepository.findBySteamId(player.steamId);
+      const data = playerSaveDocument(savedRow);
+      data.steamid = player.steamId;
+      recordAdminLog('info', 'Player Save', 'Authenticated player data saved', 200);
+      res.set('Cache-Control', 'no-store').json({ success: true, data });
+    });
+  } catch (error) {
+    console.error('[Player Save] savePlayerData:', error.message);
+    const status = /must be|too large|Invalid|contains invalid|must be an array/i.test(error.message) ? 400 : 503;
+    res.status(status).json({ success: false, error: status === 400 ? error.message : 'Player data could not be saved' });
+  }
+});
 function safeGameSnapshot(value, depth = 0) {
   if (depth > 8) return null;
   if (value === null || ['string','number','boolean'].includes(typeof value)) return value;
@@ -634,7 +701,7 @@ app.post('/live/player/gameplay/endgameresult', async (req, res) => {
       const slotCandidate = body.characterSlot ?? body.character_slot ?? body.slots
         ?? nested.characterSlot ?? nested.character_slot ?? nested.slots;
       const directSlotFields = ['hunterSlot','survivorSlot','characterhunteritem','characteritem']
-        .some(key => Object.hasOwn(body, key));
+        .some(key => Object.hasOwn(body, key)) || Object.hasOwn(body, 'character');
       const slotPayload = slotCandidate && typeof slotCandidate === 'object' && !Array.isArray(slotCandidate)
         ? slotCandidate : directSlotFields ? body : null;
       if (slotPayload) {
@@ -642,6 +709,9 @@ app.post('/live/player/gameplay/endgameresult', async (req, res) => {
         for (const key of ['hunterSlot','survivorSlot','characterhunteritem','characteritem']) {
           if (Object.hasOwn(slotPayload, key)) normalized[key] = slotPayload[key];
         }
+        const characterId = String(slotPayload.character ?? '');
+        if (characterId.startsWith('Hunter_') && !normalized.hunterSlot) normalized.hunterSlot = [slotPayload];
+        if (characterId.startsWith('Survivor_') && !normalized.survivorSlot) normalized.survivorSlot = [slotPayload];
         if (Object.keys(normalized).length) {
           await inventoryService.updateCharacterSlot(player, normalized, body.role ?? nested.role);
           recordAdminLog('info', 'Player Save', 'Character loadout received with end-game result and saved', 200);
