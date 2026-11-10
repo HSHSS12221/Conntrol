@@ -81,7 +81,8 @@ exports.editCharacterSlot = async (req, res) => {
     const nestedValue = getField(body, ['data']);
     const nested = nestedValue && typeof nestedValue === 'object' && !Array.isArray(nestedValue) ? nestedValue : {};
     const directSlots = ['hunterSlot','survivorSlot','characterhunteritem','characteritem']
-      .some(key => getField(body, [key]) !== undefined);
+      .some(key => getField(body, [key]) !== undefined)
+      || getField(body, ['character']) !== undefined;
     const slots = getField(body, ['slots','characterSlot','character_slot'])
       ?? getField(nested, ['slots','characterSlot','character_slot'])
       ?? (directSlots ? body : null);
@@ -89,7 +90,7 @@ exports.editCharacterSlot = async (req, res) => {
     if (!slots || typeof slots !== 'object' || Array.isArray(slots)) {
       return sendError(res, 400, 'Character slot data is missing (expected slots or characterSlot)');
     }
-    const hasSlotFields = ['hunterSlot','survivorSlot','characterhunteritem','characteritem']
+    const hasSlotFields = ['hunterSlot','survivorSlot','characterhunteritem','characteritem','character']
       .some(key => getField(slots, [key]) !== undefined);
     if (!hasSlotFields) {
       return sendError(res, 400, 'Character slot payload has no editable slot fields');
@@ -98,6 +99,14 @@ exports.editCharacterSlot = async (req, res) => {
     for (const key of ['hunterSlot','survivorSlot','characterhunteritem','characteritem']) {
       const value = getField(slots, [key]);
       if (value !== undefined) normalizedSlots[key] = value;
+    }
+    const singleCharacterId = getField(slots, ['character']);
+    if (singleCharacterId !== undefined) {
+      const character = String(singleCharacterId);
+      const collection = character.startsWith('Hunter_') ? 'hunterSlot'
+        : character.startsWith('Survivor_') ? 'survivorSlot' : null;
+      if (!collection) return sendError(res, 400, 'Character slot payload has an unknown character ID');
+      if (!normalizedSlots[collection]) normalizedSlots[collection] = [slots];
     }
     const result = await inventoryService.updateCharacterSlot(player, normalizedSlots, role);
 
