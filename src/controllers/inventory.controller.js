@@ -1,4 +1,5 @@
 const inventoryService = require('@services/inventory.service');
+const playerDataService = require('@services/player-data.service');
 const { sendError, sendSuccess } = require('@utils/response.util');
 
 function getAuthenticatedPlayer(req, res) {
@@ -31,6 +32,11 @@ exports.getInventoryAll = async (req, res) => {
     if (!player) {
       return null;
     }
+
+    // This endpoint is the fresh snapshot the game applies after auth. Seed
+    // legacy zero balances here too, so that snapshot cannot replace 6,000
+    // shown by auth with stale zeros from an older Supabase row.
+    if (playerDataService.seedInitialCurrencies(player)) await player.save();
 
     return sendSuccess(res, inventoryService.getInventoryState(player));
   } catch (error) {
