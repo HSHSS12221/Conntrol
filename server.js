@@ -8,6 +8,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { createGameDataService } = require('./src/services/game-data.service');
 const { createWhitelistRepository } = require('./src/repositories/whitelist.repository');
 const playerDataService = require('./src/services/player-data.service');
+const inventoryService = require('./src/services/inventory.service');
 const PlayerModel = require('./src/models/player.model');
 const ServerInfoModel = require('./src/models/server.model');
 const staticJsonUtil = require('./src/utils/static-json.util');
@@ -452,7 +453,7 @@ app.post('/live/player/authen', async (req, res) => {
     // Load ServerInfo before updating session state so configuration failures
     // are reported clearly and do not leave a half-created login session.
     const { serverInfo } = await readGameServerInfo();
-    await playerDataService.getOrCreatePlayerData(steamId, row.player_name || 'Player_' + steamId.slice(-6));
+    const playerData = await playerDataService.getOrCreatePlayerData(steamId, row.player_name || 'Player_' + steamId.slice(-6));
     recordAdminLog('info', 'Steam Auth', 'Steam ticket and whitelist passed; ServerInfo loaded');
 
     const now = new Date().toISOString();
@@ -470,15 +471,22 @@ app.post('/live/player/authen', async (req, res) => {
     player.auth = updatedAuth;
     player.session_token = sessionToken;
     player.profile = { ...player.profile, ...(saved.profile || {}), displayName: saved.player_name || saved.profile?.displayName || `Player_${steamId.slice(-6)}`, updatedAt: now };
-    player.characterSlot = saved.character_slot || player.characterSlot;
-    player.role = saved.role || player.role;
-    player.stickerSlot = saved.sticker_slot || player.stickerSlot;
-    player.inventory = toLegacyInventory(saved.inventory, player.inventory);
-    player.coin = saved.coin ?? player.coin;
-    player.amethyst = saved.amethyst ?? player.amethyst;
-    player.amulet = saved.amulet ?? player.amulet;
-    player.banStatus = saved.ban_status || player.banStatus;
-    player.playerRecord = saved.player_record || player.playerRecord;
+    const savedSlots = saved.character_slot && typeof saved.character_slot === 'object' ? saved.character_slot : null;
+    const hasSavedLoadouts = savedSlots && (
+      (Array.isArray(savedSlots.hunterSlot) && savedSlots.hunterSlot.length > 0) ||
+      (Array.isArray(savedSlots.survivorSlot) && savedSlots.survivorSlot.length > 0)
+    );
+    player.characterSlot = hasSavedLoadouts ? savedSlots : (playerData.characterSlot || player.characterSlot);
+    player.role = playerData.role || saved.role || player.role;
+    player.stickerSlot = playerData.stickerSlot || saved.sticker_slot || player.stickerSlot;
+    player.inventory = toLegacyInventory(playerData.inventory || saved.inventory, player.inventory);
+    // This private-server configuration grants 6,000 of each currency. Treat
+    // zero-valued legacy rows as not initialized so auth cannot send 0 back.
+    player.coin = Number(playerData.coin ?? saved.coin) || 6000;
+    player.amethyst = Number(playerData.amethyst ?? saved.amethyst) || 6000;
+    player.amulet = Number(playerData.amulet ?? saved.amulet) || 6000;
+    player.banStatus = playerData.banStatus || saved.ban_status || player.banStatus;
+    player.playerRecord = playerData.playerRecord || saved.player_record || player.playerRecord;
     player.isOnline = true;
     player.lastOnline = now;
     response.data.session_token = sessionToken;
@@ -621,6 +629,24 @@ app.post('/live/player/gameplay/endgameresult', async (req, res) => {
     await respondWithAuthedGamePlayer(req, res, async player => {
       const snapshot = safeGameSnapshot(req.body);
       if (Buffer.byteLength(JSON.stringify(snapshot), 'utf8') > 128 * 1024) return gameError(res, 413, 'Game result payload is too large');
+      const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+      const nested = body.data && typeof body.data === 'object' && !Array.isArray(body.data) ? body.data : {};
+      const slotCandidate = body.characterSlot ?? body.character_slot ?? body.slots
+        ?? nested.characterSlot ?? nested.character_slot ?? nested.slots;
+      const directSlotFields = ['hunterSlot','survivorSlot','characterhunteritem','characteritem']
+        .some(key => Object.hasOwn(body, key));
+      const slotPayload = slotCandidate && typeof slotCandidate === 'object' && !Array.isArray(slotCandidate)
+        ? slotCandidate : directSlotFields ? body : null;
+      if (slotPayload) {
+        const normalized = {};
+        for (const key of ['hunterSlot','survivorSlot','characterhunteritem','characteritem']) {
+          if (Object.hasOwn(slotPayload, key)) normalized[key] = slotPayload[key];
+        }
+        if (Object.keys(normalized).length) {
+          await inventoryService.updateCharacterSlot(player, normalized, body.role ?? nested.role);
+          recordAdminLog('info', 'Player Save', 'Character loadout received with end-game result and saved', 200);
+        }
+      }
       player.lastGameResult = snapshot;
       player.lastGameResultAt = new Date().toISOString();
       await player.save();
@@ -628,6 +654,19 @@ app.post('/live/player/gameplay/endgameresult', async (req, res) => {
       res.json({ status: 1, data: { message: 'result saved' }, error: null });
     });
   } catch (error) { console.error('[End Game Result]', error.message); gameError(res, 503, 'Game result could not be saved'); }
+});
+app.get('/live/bonus/api/get_bonus_data', async (_req, res) => {
+  try {
+    const item = await gameDataService.get('static/bonus/api/get_bonus_data.json');
+    if (item?.data !== undefined) {
+      return res.set('Cache-Control', 'no-store').json(item.data);
+    }
+    recordAdminLog('warn', 'Game API', 'Bonus endpoint has no synced static payload; returning an empty compatibility object', 200);
+    return res.set('Cache-Control', 'no-store').json({ status: 1, data: {}, error: null });
+  } catch (error) {
+    console.error('[Bonus Data]', error.message);
+    return gameError(res, 503, 'Bonus data could not be loaded');
+  }
 });
 app.post('/live/exprk/api/table', async (_req, res) => {
   try {
