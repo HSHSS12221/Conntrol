@@ -6,6 +6,9 @@ const crypto = require('node:crypto');
 
 const STATIC_ROOT = path.resolve(__dirname, '../../data/static');
 const MAX_SEED_FILES = 1000;
+const STATIC_CACHE_TTL_MS = 30_000;
+const staticCache = new Map();
+const staticReadsInFlight = new Map();
 
 function normalizeStaticPath(value) {
   const normalized = String(value || '').replace(/\\/g, '/').replace(/^\/+/, '');
@@ -41,10 +44,21 @@ function createGameDataService(supabase) {
 
     async get(filePath) {
       const key = normalizeStaticPath(filePath);
-      const { data, error } = await supabase.from('game_static_data').select('data,updated_at').eq('file_path', key).maybeSingle();
-      if (error) throw error;
-      if (!data) return null;
-      return { path: key, updated_at: data.updated_at, data: data.data };
+      const cached = staticCache.get(key);
+      if (cached && cached.expiresAt > Date.now()) return structuredClone(cached.value);
+      if (staticReadsInFlight.has(key)) return structuredClone(await staticReadsInFlight.get(key));
+
+      const read = (async () => {
+        const { data, error } = await supabase.from('game_static_data').select('data,updated_at').eq('file_path', key).maybeSingle();
+        if (error) throw error;
+        const value = data ? { path: key, updated_at: data.updated_at, data: data.data } : null;
+        if (value) staticCache.set(key, { value: structuredClone(value), expiresAt: Date.now() + STATIC_CACHE_TTL_MS });
+        else staticCache.delete(key);
+        return value;
+      })();
+      staticReadsInFlight.set(key, read);
+      try { return structuredClone(await read); }
+      finally { staticReadsInFlight.delete(key); }
     },
 
     async syncFromRepository() {
@@ -65,6 +79,7 @@ function createGameDataService(supabase) {
         if (error) throw error;
         synced += data.length;
       }
+      staticCache.clear();
       return { synced, files };
     }
   };
