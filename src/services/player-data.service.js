@@ -69,6 +69,15 @@ class PlayerDataService {
     this.allItemsInventory = null;
   }
 
+  seedInitialCurrencies(player) {
+    if (Number(player?.__currency_seed_version || 0) >= CURRENCY_SEED_VERSION) return false;
+    for (const [key, value] of Object.entries(DEFAULT_PLAYER_CURRENCIES)) {
+      if (!Number.isFinite(Number(player[key])) || Number(player[key]) === 0) player[key] = value;
+    }
+    player.__currency_seed_version = CURRENCY_SEED_VERSION;
+    return true;
+  }
+
   async loadBasePlayerData() {
     if (!this.basePlayerData) {
       this.basePlayerData = await staticJson.load('static/player/auth.json');
@@ -239,15 +248,7 @@ class PlayerDataService {
       // though the 6,000 balance was never persisted. Seed zero balances once
       // for those legacy rows; the marker prevents refilling a balance that a
       // player later spends down to zero.
-      if (Number(existingPlayer.__currency_seed_version || 0) < CURRENCY_SEED_VERSION) {
-        for (const [key, value] of Object.entries(DEFAULT_PLAYER_CURRENCIES)) {
-          if (!Number.isFinite(Number(existingPlayer[key])) || Number(existingPlayer[key]) === 0) {
-            existingPlayer[key] = value;
-          }
-        }
-        existingPlayer.__currency_seed_version = CURRENCY_SEED_VERSION;
-        await existingPlayer.save();
-      }
+      if (this.seedInitialCurrencies(existingPlayer)) await existingPlayer.save();
       if (!existingPlayer.__player_template_version) {
         const template = await this.loadPlayerTemplate();
         const reserved = new Set(['steamId','steam_id','auth','session_token','profile','coin','amethyst','amulet','characterSlot','role','banStatus','playerRecord','stickerSlot','inventory','immortalData','isOnline','lastOnline','status','player_name','discord_id','notes','id','_id','createdAt','updatedAt','_exists','game_data']);
