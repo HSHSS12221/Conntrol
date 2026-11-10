@@ -206,32 +206,54 @@ function gameDownloadPublicUrl(objectPath) {
   const { data } = supabase.storage.from(GAME_DOWNLOAD_BUCKET).getPublicUrl(objectPath, { download: true });
   return data.publicUrl;
 }
-app.get('/api/game-downloads', async (_req, res, next) => {
+app.get('/api/mods', async (_req, res, next) => {
   try {
     await ensureGameDownloadBucket();
     const rows = [];
-    for (let offset = 0; offset < 2000; offset += 100) {
-      const { data, error } = await supabase.storage.from(GAME_DOWNLOAD_BUCKET).list('games', { limit: 100, offset, sortBy: { column: 'created_at', order: 'desc' } });
-      if (error) throw error;
-      rows.push(...data.filter(item => item.name && !item.id?.endsWith('/')));
-      if (data.length < 100) break;
+    for (const target of ['Binaries', 'Config', 'Content']) {
+      for (let offset = 0; offset < 2000; offset += 100) {
+        const { data, error } = await supabase.storage.from(GAME_DOWNLOAD_BUCKET).list(target, { limit: 100, offset, sortBy: { column: 'created_at', order: 'desc' } });
+        if (error) throw error;
+        rows.push(...data.filter(item => item.name && !item.id?.endsWith('/')).map(item => ({ ...item, target })));
+        if (data.length < 100) break;
+      }
     }
     const files = rows.map(item => {
-      const objectPath = `games/${item.name}`;
+      const objectPath = `${item.target}/${item.name}`;
       const splitAt = item.name.indexOf('__');
-      return { path: objectPath, name: splitAt >= 0 ? item.name.slice(splitAt + 2) : item.name, size: Number(item.metadata?.size) || 0, created_at: item.created_at || null, url: gameDownloadPublicUrl(objectPath) };
+      return { path: objectPath, target: item.target, name: splitAt >= 0 ? item.name.slice(splitAt + 2) : item.name, size: Number(item.metadata?.size) || 0, created_at: item.created_at || null, url: gameDownloadPublicUrl(objectPath) };
     });
     res.set('Cache-Control', 'no-store').json({ files, max_file_bytes: GAME_DOWNLOAD_MAX_BYTES, used_bytes: files.reduce((sum, file) => sum + file.size, 0) });
   } catch (error) { next(error); }
 });
-app.post('/api/game-downloads/upload', async (req, res, next) => {
+// Launcher-facing manifest: each archive is installed into the selected game-root folder.
+app.get('/public/mods', async (_req, res, next) => {
+  try {
+    await ensureGameDownloadBucket();
+    const rows = [];
+    for (const target of ['Binaries', 'Config', 'Content']) {
+      const { data, error } = await supabase.storage.from(GAME_DOWNLOAD_BUCKET).list(target, { limit: 1000, sortBy: { column: 'created_at', order: 'asc' } });
+      if (error) throw error;
+      for (const item of data || []) if (item.name && !item.id?.endsWith('/')) {
+        const path = `${target}/${item.name}`;
+        const splitAt = item.name.indexOf('__');
+        rows.push({ id: item.name.slice(0, splitAt), name: splitAt >= 0 ? item.name.slice(splitAt + 2) : item.name, install_into: target, size: Number(item.metadata?.size) || 0, url: gameDownloadPublicUrl(path), created_at: item.created_at || null, updated_at: item.updated_at || item.created_at || null });
+      }
+    }
+    res.set('Cache-Control', 'no-store').json({ version: 1, mods: rows });
+  } catch (error) { next(error); }
+});
+app.post('/api/mods/upload', async (req, res, next) => {
   try {
     if (!SUPABASE_ANON_KEY) return res.status(503).json({ error: 'ตั้งค่า SUPABASE_ANON_KEY ใน Render Environment ก่อนอัปโหลด (ใช้ publishable/anon key ห้ามใช้ service-role key)' });
+    const target = String(req.body?.target || '');
+    if (!['Binaries', 'Config', 'Content'].includes(target)) return res.status(400).json({ error: 'ปลายทางต้องเป็น Binaries, Config หรือ Content' });
     const name = safeGameDownloadName(req.body?.name);
+    if (!name.toLowerCase().endsWith('.zip')) return res.status(400).json({ error: 'แพ็กเกจมอดต้องเป็นไฟล์ .zip' });
     const size = Number(req.body?.size);
     if (!Number.isSafeInteger(size) || size <= 0 || size > GAME_DOWNLOAD_MAX_BYTES) return res.status(400).json({ error: `ไฟล์ต้องมีขนาดไม่เกิน ${(GAME_DOWNLOAD_MAX_BYTES / 1024 ** 3).toFixed(1)} GB` });
     await ensureGameDownloadBucket();
-    const objectPath = `games/${crypto.randomUUID()}__${name}`;
+    const objectPath = `${target}/${crypto.randomUUID()}__${name}`;
     const { data, error } = await supabase.storage.from(GAME_DOWNLOAD_BUCKET).createSignedUploadUrl(objectPath, { upsert: false });
     if (error) throw error;
     const supabaseUrl = new URL(SUPABASE_URL);
@@ -240,16 +262,16 @@ app.post('/api/game-downloads/upload', async (req, res, next) => {
       : supabaseUrl.origin;
     // TUS signed uploads use the dedicated `/sign` endpoint. The anon/publishable
     // key is safe to send to the browser; never return the service-role key here.
-    res.status(201).json({ path: objectPath, token: data.token, bucket: GAME_DOWNLOAD_BUCKET, storage_origin: storageOrigin, apikey: SUPABASE_ANON_KEY || null, max_file_bytes: GAME_DOWNLOAD_MAX_BYTES });
+    res.status(201).json({ path: objectPath, target, token: data.token, bucket: GAME_DOWNLOAD_BUCKET, storage_origin: storageOrigin, apikey: SUPABASE_ANON_KEY || null, max_file_bytes: GAME_DOWNLOAD_MAX_BYTES });
   } catch (error) { next(error); }
 });
-app.delete('/api/game-downloads', async (req, res, next) => {
+app.delete('/api/mods', async (req, res, next) => {
   try {
     const objectPath = String(req.body?.path || '');
-    if (!/^games\/[0-9a-f-]{36}__[\w\-.() \u0E00-\u0E7F]{1,140}$/i.test(objectPath)) return res.status(400).json({ error: 'Invalid game download path' });
+    if (!/^(?:Binaries|Config|Content)\/[0-9a-f-]{36}__[\w\-.() \u0E00-\u0E7F]{1,140}\.zip$/i.test(objectPath)) return res.status(400).json({ error: 'Invalid mod package path' });
     const { error } = await supabase.storage.from(GAME_DOWNLOAD_BUCKET).remove([objectPath]);
     if (error) throw error;
-    recordAdminLog('info', 'Game Downloads', `Deleted ${objectPath.slice(0, 170)}`, 200);
+    recordAdminLog('info', 'Mods', `Deleted ${objectPath.slice(0, 170)}`, 200);
     res.json({ deleted: true });
   } catch (error) { next(error); }
 });
