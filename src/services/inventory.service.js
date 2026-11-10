@@ -262,6 +262,45 @@ class InventoryService {
     return structuredClone(slotData);
   }
 
+  mergeLoadoutValue(previous, incoming) {
+    if (Array.isArray(incoming)) return structuredClone(incoming);
+    if (!incoming || typeof incoming !== 'object') return incoming;
+    const result = previous && typeof previous === 'object' && !Array.isArray(previous)
+      ? structuredClone(previous) : {};
+    for (const [key, value] of Object.entries(incoming)) {
+      result[key] = value && typeof value === 'object' && !Array.isArray(value)
+        ? this.mergeLoadoutValue(result[key], value)
+        : structuredClone(value);
+    }
+    return result;
+  }
+
+  mergeCharacterLoadouts(previous = [], incoming = []) {
+    if (!Array.isArray(previous) || !previous.length) return structuredClone(incoming);
+    if (!Array.isArray(incoming) || !incoming.length) return structuredClone(previous);
+    const identity = (slot, index) => String(
+      slot.character ?? slot.characterId ?? slot.slotId ?? slot.id ?? `index:${index}`
+    );
+    const oldById = new Map(previous.map((slot, index) => [identity(slot, index), slot]));
+    const merged = incoming.map((slot, index) => {
+      const key = identity(slot, index);
+      const oldSlot = oldById.get(key);
+      oldById.delete(key);
+      return oldSlot ? this.mergeLoadoutValue(oldSlot, slot) : structuredClone(slot);
+    });
+    // A partial update can contain only the currently selected character.
+    // Keep the other characters' saved outfits instead of replacing the list.
+    for (const slot of previous) {
+      if (oldById.size === 0) break;
+      const key = identity(slot, previous.indexOf(slot));
+      if (oldById.has(key)) {
+        merged.push(structuredClone(slot));
+        oldById.delete(key);
+      }
+    }
+    return merged;
+  }
+
   async updateCharacterSlot(player, slotData, role) {
     const sanitizedSlotData = this.sanitizeCharacterSlots(player, slotData);
     const validationErrors = this.validateCharacterSlot(player, sanitizedSlotData);
@@ -271,8 +310,17 @@ class InventoryService {
     }
 
     let hasChanges = false;
-
-    Object.assign(player.characterSlot, sanitizedSlotData);
+    const current = player.characterSlot && typeof player.characterSlot === 'object'
+      ? player.characterSlot : {};
+    const merged = structuredClone(current);
+    for (const [key, value] of Object.entries(sanitizedSlotData)) {
+      if (key === 'hunterSlot' || key === 'survivorSlot') {
+        merged[key] = this.mergeCharacterLoadouts(current[key] || [], value);
+      } else {
+        merged[key] = this.mergeLoadoutValue(current[key], value);
+      }
+    }
+    player.characterSlot = merged;
     hasChanges = Object.keys(sanitizedSlotData).length > 0;
 
     if (role !== undefined && ['hunter', 'survivor'].includes(role)) {
