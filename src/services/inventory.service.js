@@ -210,21 +210,9 @@ class InventoryService {
     if (!player.characterSlot) {
       return null;
     }
-
-    const ownedCharacters = player.inventory?.characters || [];
-    const sanitizeSlots = (slots = []) =>
-      slots.filter((slot) => slot.character === 'None' || ownedCharacters.includes(slot.character));
-
-    return {
-      hunterSlot: sanitizeSlots(player.characterSlot.hunterSlot),
-      survivorSlot: sanitizeSlots(player.characterSlot.survivorSlot),
-      characterhunteritem: ownedCharacters.includes(player.characterSlot.characterhunteritem)
-        ? player.characterSlot.characterhunteritem
-        : 'Hunter_Belle',
-      characteritem: ownedCharacters.includes(player.characterSlot.characteritem)
-        ? player.characterSlot.characteritem
-        : 'Survivor_Tim',
-    };
+    // A saved loadout is player state, not an inventory grant. Returning only
+    // inventory-owned cosmetics here made valid saved outfits revert to defaults.
+    return structuredClone(player.characterSlot);
   }
 
   collectSlotValidationErrors(player, slots = [], slotLabel, cosmeticFields) {
@@ -254,48 +242,24 @@ class InventoryService {
   }
 
   validateCharacterSlot(player, slotData) {
-    const errors = [
-      ...this.collectSlotValidationErrors(player, slotData.hunterSlot, 'Hunter', [
-        'cosmetic_hat',
-        'cosmetic_cloth',
-        'cosmetic_back',
-        'cosmetic_acc1',
-        'cosmetic_acc2',
-        'cosmetic_acc3',
-      ]),
-      ...this.collectSlotValidationErrors(player, slotData.survivorSlot, 'Survivor', [
-        'cosmetic_hat',
-        'cosmetic_cloth',
-        'cosmetic_back',
-      ]),
-    ];
-
-    if (
-      slotData.characterhunteritem &&
-      !this.playerOwnsItem(player, slotData.characterhunteritem)
-    ) {
-      errors.push(`Hunter character not owned: ${slotData.characterhunteritem}`);
+    const errors = [];
+    for (const key of ['hunterSlot', 'survivorSlot']) {
+      if (slotData[key] !== undefined && !Array.isArray(slotData[key])) errors.push(`${key} must be an array`);
+      if (Array.isArray(slotData[key]) && (slotData[key].length > 32 || slotData[key].some(slot => !slot || typeof slot !== 'object' || Array.isArray(slot)))) {
+        errors.push(`${key} contains invalid slot data`);
+      }
     }
-
-    if (slotData.characteritem && !this.playerOwnsItem(player, slotData.characteritem)) {
-      errors.push(`Survivor character not owned: ${slotData.characteritem}`);
+    for (const key of ['characterhunteritem', 'characteritem']) {
+      if (slotData[key] !== undefined && typeof slotData[key] !== 'string') errors.push(`${key} must be a string`);
     }
-
+    if (Buffer.byteLength(JSON.stringify(slotData), 'utf8') > 200 * 1024) errors.push('Character slot data is too large');
     return errors;
   }
 
   sanitizeCharacterSlots(player, slotData) {
-    const ownedCharacters = player.inventory?.characters || [];
-    const sanitize = (slots) =>
-      Array.isArray(slots)
-        ? slots.filter((slot) => slot.character === 'None' || ownedCharacters.includes(slot.character))
-        : slots;
-
-    return {
-      ...slotData,
-      hunterSlot: sanitize(slotData.hunterSlot),
-      survivorSlot: sanitize(slotData.survivorSlot),
-    };
+    // Keep the complete loadout sent by the authenticated game client. Do not
+    // change the inventory/ownership lists as a side effect of saving it.
+    return structuredClone(slotData);
   }
 
   async updateCharacterSlot(player, slotData, role) {
@@ -308,12 +272,8 @@ class InventoryService {
 
     let hasChanges = false;
 
-    ['hunterSlot', 'survivorSlot', 'characterhunteritem', 'characteritem'].forEach((key) => {
-      if (sanitizedSlotData[key] !== undefined) {
-        player.characterSlot[key] = sanitizedSlotData[key];
-        hasChanges = true;
-      }
-    });
+    Object.assign(player.characterSlot, sanitizedSlotData);
+    hasChanges = Object.keys(sanitizedSlotData).length > 0;
 
     if (role !== undefined && ['hunter', 'survivor'].includes(role)) {
       player.role = role;
