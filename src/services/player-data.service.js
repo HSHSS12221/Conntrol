@@ -1,5 +1,6 @@
 const Player = require('@models/player.model');
 const staticJson = require('@utils/static-json.util');
+const inventoryService = require('@services/inventory.service');
 
 const DEFAULT_SKINS = {
   Hunter_Pray: 'Skin_Nymph_D_Default',
@@ -39,15 +40,32 @@ const DEFAULT_SKINS = {
 };
 
 const DEFAULT_PLAYER_CURRENCIES = {
-  coin: 250000,
-  amethyst: 0,
-  amulet: 0,
+  coin: 6000,
+  amethyst: 6000,
+  amulet: 6000,
+};
+
+// These catalogs are the game's own item IDs. They are loaded from the
+// Supabase-backed static-data table, then merged into each player's inventory.
+const INVENTORY_CATALOGS = {
+  Characters: 'characters',
+  Skins: 'skins',
+  Perks: 'perks',
+  Profile: 'profiles',
+  Stickers: 'stickers',
+  Heads: 'heads',
+  Backs: 'backs',
+  Bundles: 'bundles',
+  Poses: 'poses',
+  SummonEffect: 'effects',
+  Rituals: 'rituals',
 };
 
 class PlayerDataService {
   constructor() {
     this.nameCooldown = 12 * 60 * 60 * 1000;
     this.basePlayerData = null;
+    this.allItemsInventory = null;
   }
 
   async loadBasePlayerData() {
@@ -61,6 +79,72 @@ class PlayerDataService {
   async loadPlayerTemplate() {
     const template = await staticJson.load('static/player/PlayerTemplate.json');
     return this.parseDates(template);
+  }
+
+  async loadAllItemsInventory() {
+    if (this.allItemsInventory) return structuredClone(this.allItemsInventory);
+    const inventory = {
+      devAccount: false,
+      characters: [], items: [], itemCounts: [], skins: [], perks: [], profiles: [],
+      stickers: [], heads: [], backs: [], costumes: [], rituals: [], cosmeticconsume: [],
+      bundles: [], poses: [], effects: [], lootBoxAmount: 50, bulletAmount: 50,
+    };
+
+    for (const [catalogName, category] of Object.entries(INVENTORY_CATALOGS)) {
+      const catalog = await staticJson.load(`static/inventory/${catalogName}.json`);
+      for (const itemId of Object.keys(catalog || {})) {
+        if (!inventory[category].includes(itemId)) inventory[category].push(itemId);
+      }
+    }
+
+    for (const catalogName of ['Items', 'K_Cosmetic', 'S_Cosmetic']) {
+      const catalog = await staticJson.load(`static/inventory/${catalogName}.json`);
+      for (const itemId of Object.keys(catalog || {})) {
+        const category = catalogName === 'Items' ? 'items' : inventoryService.resolveInventoryCategory(itemId);
+        if (category === 'items') {
+          if (!inventory.items.includes(itemId)) {
+            inventory.items.push(itemId);
+            inventory.itemCounts.push(1);
+          }
+        } else if (Array.isArray(inventory[category]) && !inventory[category].includes(itemId)) {
+          inventory[category].push(itemId);
+        }
+      }
+    }
+
+    this.allItemsInventory = inventory;
+    return structuredClone(inventory);
+  }
+
+  async grantAllItemsAndSetCurrency(player) {
+    const allItems = await this.loadAllItemsInventory();
+    const inventory = player.inventory && typeof player.inventory === 'object'
+      ? player.inventory
+      : {};
+    for (const [key, value] of Object.entries(allItems)) {
+      if (key === 'items' || key === 'itemCounts') continue;
+      if (Array.isArray(value)) {
+        const current = Array.isArray(inventory[key]) ? inventory[key] : [];
+        inventory[key] = [...new Set([...current, ...value])];
+      } else if (inventory[key] === undefined) {
+        inventory[key] = value;
+      }
+    }
+    inventory.items = Array.isArray(inventory.items) ? inventory.items : [];
+    inventory.itemCounts = Array.isArray(inventory.itemCounts) ? inventory.itemCounts : [];
+    while (inventory.itemCounts.length < inventory.items.length) inventory.itemCounts.push(1);
+    inventory.itemCounts.length = inventory.items.length;
+    for (const itemId of allItems.items) {
+      const index = inventory.items.indexOf(itemId);
+      if (index < 0) {
+        inventory.items.push(itemId);
+        inventory.itemCounts.push(1);
+      } else if (!Number.isFinite(Number(inventory.itemCounts[index])) || Number(inventory.itemCounts[index]) < 1) {
+        inventory.itemCounts[index] = 1;
+      }
+    }
+    player.inventory = inventory;
+    Object.assign(player, DEFAULT_PLAYER_CURRENCIES);
   }
 
   parseDates(value) {
@@ -162,9 +246,7 @@ class PlayerDataService {
         existingPlayer.characterSlot = existingPlayer.characterSlot || characterSlot;
         existingPlayer.inventory = existingPlayer.inventory || inventory;
         if (isFreshWhitelistRow) {
-          existingPlayer.coin = template.coin ?? DEFAULT_PLAYER_CURRENCIES.coin;
-          existingPlayer.amethyst = template.amethyst ?? DEFAULT_PLAYER_CURRENCIES.amethyst;
-          existingPlayer.amulet = template.amulet ?? DEFAULT_PLAYER_CURRENCIES.amulet;
+          Object.assign(existingPlayer, DEFAULT_PLAYER_CURRENCIES);
           existingPlayer.profile = { ...template.profile, ...(existingPlayer.profile || {}) };
           existingPlayer.role = template.role || existingPlayer.role || 'survivor';
           existingPlayer.banStatus = existingPlayer.banStatus || template.banStatus;
@@ -175,6 +257,9 @@ class PlayerDataService {
         existingPlayer.__player_template_version = 1;
         await existingPlayer.save();
       }
+      await this.grantAllItemsAndSetCurrency(existingPlayer);
+      existingPlayer.markModified('inventory');
+      await existingPlayer.save();
       return this.syncPlayerDisplayName(existingPlayer, steamName);
     }
 
@@ -200,6 +285,8 @@ class PlayerDataService {
       isOnline: true,
       lastOnline: new Date(),
     });
+
+    await this.grantAllItemsAndSetCurrency(newPlayer);
 
     await newPlayer.save();
     return newPlayer;
