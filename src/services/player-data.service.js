@@ -44,6 +44,7 @@ const DEFAULT_PLAYER_CURRENCIES = {
   amethyst: 6000,
   amulet: 6000,
 };
+const CURRENCY_SEED_VERSION = 1;
 
 // These catalogs are the game's own item IDs. They are loaded from the
 // Supabase-backed static-data table, then merged into each player's inventory.
@@ -234,6 +235,19 @@ class PlayerDataService {
     const existingPlayer = await Player.findOne({ steamId });
 
     if (existingPlayer) {
+      // Older rows could show the starter balance in the auth response even
+      // though the 6,000 balance was never persisted. Seed zero balances once
+      // for those legacy rows; the marker prevents refilling a balance that a
+      // player later spends down to zero.
+      if (Number(existingPlayer.__currency_seed_version || 0) < CURRENCY_SEED_VERSION) {
+        for (const [key, value] of Object.entries(DEFAULT_PLAYER_CURRENCIES)) {
+          if (!Number.isFinite(Number(existingPlayer[key])) || Number(existingPlayer[key]) === 0) {
+            existingPlayer[key] = value;
+          }
+        }
+        existingPlayer.__currency_seed_version = CURRENCY_SEED_VERSION;
+        await existingPlayer.save();
+      }
       if (!existingPlayer.__player_template_version) {
         const template = await this.loadPlayerTemplate();
         const reserved = new Set(['steamId','steam_id','auth','session_token','profile','coin','amethyst','amulet','characterSlot','role','banStatus','playerRecord','stickerSlot','inventory','immortalData','isOnline','lastOnline','status','player_name','discord_id','notes','id','_id','createdAt','updatedAt','_exists','game_data']);
@@ -268,6 +282,7 @@ class PlayerDataService {
             lastNameUpdate: existingPlayer.profile?.lastNameUpdate || new Date(),
           };
           Object.assign(existingPlayer, DEFAULT_PLAYER_CURRENCIES);
+          existingPlayer.__currency_seed_version = CURRENCY_SEED_VERSION;
           existingPlayer.role = template.role || existingPlayer.role || 'survivor';
           existingPlayer.banStatus = existingPlayer.banStatus || template.banStatus;
           existingPlayer.playerRecord = existingPlayer.playerRecord || template.playerRecord;
@@ -296,6 +311,7 @@ class PlayerDataService {
       steamId,
       ...template,
       __player_template_version: 1,
+      __currency_seed_version: CURRENCY_SEED_VERSION,
       characterSlot,
       inventory,
       profile: {
