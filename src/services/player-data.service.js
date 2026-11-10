@@ -236,60 +236,51 @@ class PlayerDataService {
     if (existingPlayer) {
       if (!existingPlayer.__player_template_version) {
         const template = await this.loadPlayerTemplate();
-        const { characterSlot, inventory } = this.assignDefaultSkinsToSlots(template.characterSlot, template.inventory);
-        this.ensureDefaultSkinsInInventory(inventory);
         const reserved = new Set(['steamId','steam_id','auth','session_token','profile','coin','amethyst','amulet','characterSlot','role','banStatus','playerRecord','stickerSlot','inventory','immortalData','isOnline','lastOnline','status','player_name','discord_id','notes','id','_id','createdAt','updatedAt','_exists','game_data']);
-        const isFreshWhitelistRow = !existingPlayer.inventory && !existingPlayer.characterSlot && !Object.keys(existingPlayer).some(key => !reserved.has(key));
-        for (const [key, value] of Object.entries(template)) {
-          if (!reserved.has(key) && existingPlayer[key] === undefined) existingPlayer[key] = value;
-        }
-        const currentSlots = existingPlayer.characterSlot && typeof existingPlayer.characterSlot === 'object'
-          ? existingPlayer.characterSlot
-          : {};
-        existingPlayer.characterSlot = {
-          ...structuredClone(characterSlot),
-          ...currentSlots,
-          hunterSlot: Array.isArray(currentSlots.hunterSlot) && currentSlots.hunterSlot.length
-            ? currentSlots.hunterSlot : structuredClone(characterSlot.hunterSlot || []),
-          survivorSlot: Array.isArray(currentSlots.survivorSlot) && currentSlots.survivorSlot.length
-            ? currentSlots.survivorSlot : structuredClone(characterSlot.survivorSlot || []),
-          characterhunteritem: currentSlots.characterhunteritem || characterSlot.characterhunteritem,
-          characteritem: currentSlots.characteritem || characterSlot.characteritem,
-        };
-        existingPlayer.inventory = existingPlayer.inventory || inventory;
-        if (isFreshWhitelistRow) {
+        const isEmptyWhitelistShell =
+          !existingPlayer.inventory &&
+          !existingPlayer.characterSlot &&
+          !existingPlayer.stickerSlot &&
+          !existingPlayer.playerRecord &&
+          !existingPlayer.banStatus &&
+          !(Array.isArray(existingPlayer.immortalData) && existingPlayer.immortalData.length) &&
+          !Object.keys(existingPlayer).some(key => !reserved.has(key));
+
+        // A whitelist row created by an admin is only an account shell. Seed it
+        // once from the template. A player with any persisted game state is an
+        // existing account: preserve its saved outfit/inventory and only record
+        // that the one-time migration has been evaluated.
+        if (isEmptyWhitelistShell) {
+          const { characterSlot, inventory } = this.assignDefaultSkinsToSlots(
+            structuredClone(template.characterSlot || {}),
+            structuredClone(template.inventory || {})
+          );
+          this.ensureDefaultSkinsInInventory(inventory);
+          for (const [key, value] of Object.entries(template)) {
+            if (!reserved.has(key)) existingPlayer[key] = structuredClone(value);
+          }
+          existingPlayer.characterSlot = characterSlot;
+          existingPlayer.inventory = inventory;
+          existingPlayer.profile = {
+            ...structuredClone(template.profile || {}),
+            ...(existingPlayer.profile || {}),
+            displayName: existingPlayer.profile?.displayName || steamName,
+            lastNameUpdate: existingPlayer.profile?.lastNameUpdate || new Date(),
+          };
           Object.assign(existingPlayer, DEFAULT_PLAYER_CURRENCIES);
-          existingPlayer.profile = { ...template.profile, ...(existingPlayer.profile || {}) };
           existingPlayer.role = template.role || existingPlayer.role || 'survivor';
           existingPlayer.banStatus = existingPlayer.banStatus || template.banStatus;
           existingPlayer.playerRecord = existingPlayer.playerRecord || template.playerRecord;
           existingPlayer.stickerSlot = existingPlayer.stickerSlot || template.stickerSlot;
-          existingPlayer.immortalData = existingPlayer.immortalData?.length ? existingPlayer.immortalData : (template.immortalData || []);
+          existingPlayer.immortalData = existingPlayer.immortalData?.length
+            ? existingPlayer.immortalData
+            : (template.immortalData || []);
         }
         existingPlayer.__player_template_version = 1;
         await existingPlayer.save();
       }
-      const slots = existingPlayer.characterSlot && typeof existingPlayer.characterSlot === 'object'
-        ? existingPlayer.characterSlot : {};
-      const hasLoadouts = (Array.isArray(slots.hunterSlot) && slots.hunterSlot.length > 0)
-        || (Array.isArray(slots.survivorSlot) && slots.survivorSlot.length > 0);
-      if (!hasLoadouts) {
-        const template = await this.loadPlayerTemplate();
-        existingPlayer.characterSlot = {
-          ...structuredClone(template.characterSlot || {}),
-          ...slots,
-          hunterSlot: Array.isArray(slots.hunterSlot) && slots.hunterSlot.length
-            ? slots.hunterSlot : structuredClone(template.characterSlot?.hunterSlot || []),
-          survivorSlot: Array.isArray(slots.survivorSlot) && slots.survivorSlot.length
-            ? slots.survivorSlot : structuredClone(template.characterSlot?.survivorSlot || []),
-          characterhunteritem: slots.characterhunteritem || template.characterSlot?.characterhunteritem,
-          characteritem: slots.characteritem || template.characterSlot?.characteritem,
-        };
-        await existingPlayer.save();
-      }
-      await this.grantAllItemsAndSetCurrency(existingPlayer);
-      existingPlayer.markModified('inventory');
-      await existingPlayer.save();
+      // Existing players must not receive template data or starter grants on
+      // every login; doing so can overwrite or mask their saved state.
       return this.syncPlayerDisplayName(existingPlayer, steamName);
     }
 
@@ -304,6 +295,7 @@ class PlayerDataService {
     const newPlayer = new Player({
       steamId,
       ...template,
+      __player_template_version: 1,
       characterSlot,
       inventory,
       profile: {
