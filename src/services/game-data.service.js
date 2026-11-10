@@ -6,7 +6,7 @@ const crypto = require('node:crypto');
 
 const STATIC_ROOT = path.resolve(__dirname, '../../data/static');
 const MAX_SEED_FILES = 1000;
-const STATIC_CACHE_TTL_MS = 30_000;
+const STATIC_CACHE_TTL_MS = 5 * 60_000;
 const staticCache = new Map();
 const staticReadsInFlight = new Map();
 
@@ -59,6 +59,33 @@ function createGameDataService(supabase) {
       staticReadsInFlight.set(key, read);
       try { return structuredClone(await read); }
       finally { staticReadsInFlight.delete(key); }
+    },
+
+    // Preload the assets used on login/customize in one Supabase query. The
+    // game's existing endpoints remain compatible, but can now answer from
+    // memory instead of making a separate database round-trip per JSON file.
+    async warm(filePaths) {
+      const keys = [...new Set((filePaths || []).map(normalizeStaticPath))];
+      const now = Date.now();
+      const missing = keys.filter(key => {
+        const cached = staticCache.get(key);
+        return !cached || cached.expiresAt <= now;
+      });
+      if (!missing.length) return { warmed: 0, missing: [] };
+
+      const { data, error } = await supabase
+        .from('game_static_data')
+        .select('file_path,data,updated_at')
+        .in('file_path', missing);
+      if (error) throw error;
+
+      const found = new Set();
+      for (const row of data || []) {
+        const value = { path: row.file_path, updated_at: row.updated_at, data: row.data };
+        staticCache.set(row.file_path, { value: structuredClone(value), expiresAt: Date.now() + STATIC_CACHE_TTL_MS });
+        found.add(row.file_path);
+      }
+      return { warmed: found.size, missing: missing.filter(key => !found.has(key)) };
     },
 
     async syncFromRepository() {
