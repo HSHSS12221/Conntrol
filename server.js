@@ -476,8 +476,8 @@ async function readGameServerInfo() {
     IsDevOnline: readBoolean(info.IsDevOnline ?? info.is_dev_online, false)
   } };
 }
-app.get('/live/player/authen', (_req, res) => gameError(res, 405, 'Steam authentication requires a POST request from the game'));
-app.post('/live/player/authen', async (req, res) => {
+app.get(['/live/player/authen', '/live/player/auth'], (_req, res) => gameError(res, 405, 'Steam authentication requires a POST request from the game'));
+const handleSteamGameAuth = async (req, res) => {
   const requestFields = listSafeGameFieldNames(req.body);
   recordAdminLog('info', 'Steam Auth', `Received POST /live/player/authen; fields=${requestFields.join(',') || '(none)'}`);
   try {
@@ -587,7 +587,9 @@ app.post('/live/player/authen', async (req, res) => {
     recordAdminLog('error', 'Steam Auth', error.message || 'Authentication failed', 503);
     gameError(res, 503, 'Steam authentication could not be completed');
   }
-});
+};
+// Both game-client auth paths use the same real Steam ticket validation flow.
+app.post(['/live/player/authen', '/live/player/auth'], handleSteamGameAuth);
 app.get('/live/player/gameplay/checkversion', async (_req, res) => { try {
   const cid = await coreCollectionId('serverinfo');
   const { data, error } = await supabase.from('admin_documents').select('data').eq('collection_id', cid).order('created_at').limit(100);
@@ -654,6 +656,133 @@ app.get('/public/launcher-update', async (_req, res, next) => {
     res.set('Cache-Control', 'no-store').json({ version: manifest.version, url: signed.signedUrl, sha256: manifest.sha256, notes: manifest.notes || '', published_at: manifest.published_at || null });
   } catch (e) { next(e); }
 });
+// Game-client adapters use the verified Steam session and the player's
+// existing Supabase whitelist/save row. Register these before the generic
+// game routers so no older handler can shadow them.
+async function configuredGameServerTarget() {
+  let host = String(process.env.GAME_SERVER_HOST || '').trim();
+  let port = Number(process.env.GAME_SERVER_PORT || 0);
+  if (!host || !port) {
+    try {
+      const { serverInfo } = await readGameServerInfo();
+      host ||= String(serverInfo.gameServerHost ?? serverInfo.game_server_host ?? serverInfo.serverIp ?? serverInfo.server_ip ?? serverInfo.hostIp ?? serverInfo.host_ip ?? '').trim();
+      port ||= Number(serverInfo.gameServerPort ?? serverInfo.game_server_port ?? serverInfo.serverPort ?? serverInfo.server_port ?? serverInfo.port ?? 0);
+      if ((!host || !port) && serverInfo.extra && typeof serverInfo.extra === 'object') {
+        host ||= String(serverInfo.extra.gameServerHost ?? serverInfo.extra.serverIp ?? serverInfo.extra.hostIp ?? '').trim();
+        port ||= Number(serverInfo.extra.gameServerPort ?? serverInfo.extra.serverPort ?? serverInfo.extra.port ?? 0);
+      }
+    } catch (error) {
+      if (process.env.GAME_SERVER_HOST || process.env.GAME_SERVER_PORT) throw error;
+    }
+  }
+  // A loopback address only points back to each player's own computer.
+  if (!host || /^(localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[?::1\]?)$/i.test(host) || !Number.isInteger(port) || port < 1 || port > 65535)
+    return null;
+  if (/[\s/?#]/.test(host) || host.includes('://')) return null;
+  return { serverIp: host, serverPort: port, connectionAddress: `${host}:${port}` };
+}
+
+function normalizeGameLobbyResult(value, serverTarget) {
+  const result = value && typeof value === 'object' ? value : {};
+  const lobby = result.lobby && typeof result.lobby === 'object' ? result.lobby : null;
+  return {
+    ...result,
+    ...(lobby ? { lobby: { ...lobby, ...serverTarget }, lobbyId: lobby.id, roomId: lobby.room_code || lobby.id } : {}),
+    ...(serverTarget || {}),
+  };
+}
+
+async function gameRpc(req, res, rpcName, args, { requireServer = false } = {}) {
+  try {
+    if (!supabase) return gameError(res, 503, 'Game database is not configured');
+    await respondWithAuthedGamePlayer(req, res, async player => {
+      const serverTarget = await configuredGameServerTarget();
+      if (requireServer && !serverTarget) return gameError(res, 503, 'Dedicated game server host and port are not configured');
+      const { data, error } = await supabase.rpc(rpcName, { p_steam_id: player.steamId, ...args,
+        ...(serverTarget ? { p_server_ip: serverTarget.serverIp, p_server_port: serverTarget.serverPort } : {}) });
+      if (error) {
+        recordAdminLog('warn', 'Matchmaking', `${rpcName} failed (${error.code || 'database error'})`, 409);
+        return gameError(res, error.code === 'P0001' ? 409 : 503, error.code === 'P0001' ? cleanRoomText(error.message, 120) : 'Matchmaking request failed');
+      }
+      const payload = normalizeGameLobbyResult(data, serverTarget);
+      res.set('Cache-Control', 'no-store').status(200).json({ status: 1, data: payload, error: null });
+    });
+  } catch (error) {
+    console.error(`[${rpcName}]`, error.message);
+    recordAdminLog('error', 'Matchmaking', `${rpcName} could not complete`, 503);
+    if (!res.headersSent) gameError(res, 503, 'Matchmaking request could not complete');
+  }
+}
+
+async function serveGamePlayerProfile(req, res) {
+  try {
+    await respondWithAuthedGamePlayer(req, res, async player => {
+      const row = await whitelistRepository.findBySteamId(player.steamId);
+      if (!row) return gameError(res, 404, 'Player save was not found');
+      const playerData = playerSaveDocument(row);
+      playerData.steamid = player.steamId;
+      const data = {
+        player: playerData,
+        profile: row.profile || {},
+        level: Number(row.profile?.level ?? row.game_data?.level ?? 0),
+        mmr: Number(row.profile?.mmr ?? row.game_data?.mmr ?? 0),
+        currencies: { coin: Number(row.coin || 0), amethyst: Number(row.amethyst || 0), amulet: Number(row.amulet || 0) },
+        characterSlot: row.character_slot || null,
+        stickerSlot: row.sticker_slot || null,
+        inventory: row.inventory || null,
+        playerRecord: row.player_record || null,
+        immortalData: row.immortal_data || [],
+      };
+      res.set('Cache-Control', 'no-store').json({ status: 1, data, error: null });
+    });
+  } catch (error) {
+    console.error('[Game Player Profile]', error.message);
+    if (!res.headersSent) gameError(res, 503, 'Player data could not be loaded');
+  }
+}
+app.get('/live/player/profile', serveGamePlayerProfile);
+app.post('/live/player/profile', serveGamePlayerProfile);
+
+app.post('/live/lobby/create', async (req, res) => {
+  const target = await configuredGameServerTarget().catch(() => null);
+  if (!target) return gameError(res, 503, 'Configure GAME_SERVER_HOST and GAME_SERVER_PORT before creating game lobbies');
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const name = cleanRoomText(body.roomName ?? body.room_name ?? body.name ?? 'HSHO Room', 48);
+  const gameMode = cleanRoomText(body.gameMode ?? body.game_mode ?? body.mode ?? 'default', 32) || 'default';
+  const region = cleanRoomText(body.region ?? 'auto', 24) || 'auto';
+  const displayName = cleanRoomText(body.displayName ?? body.playerName ?? 'Player', 32) || 'Player';
+  const maxPlayers = Number(body.maxPlayers ?? body.max_players ?? 5);
+  if (!Number.isInteger(maxPlayers) || maxPlayers < 2 || maxPlayers > 16) return gameError(res, 400, 'maxPlayers must be an integer from 2 to 16');
+  return gameRpc(req, res, 'game_room_create', { p_name: name, p_game_mode: gameMode, p_region: region, p_max_players: maxPlayers, p_display_name: displayName }, { requireServer: true });
+});
+
+app.post('/live/matchmaking/search', async (req, res) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const target = await configuredGameServerTarget().catch(() => null);
+  return gameRpc(req, res, 'game_matchmaking_search', {
+    p_game_mode: cleanRoomText(body.gameMode ?? body.game_mode ?? body.mode ?? 'default', 32) || 'default',
+    p_region: cleanRoomText(body.region ?? 'auto', 24) || 'auto',
+    p_display_name: cleanRoomText(body.displayName ?? body.playerName ?? 'Player', 32) || 'Player',
+    p_server_ip: target?.serverIp || null, p_server_port: target?.serverPort || null,
+  });
+});
+
+app.post('/live/lobby/join', async (req, res) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const lobbyKey = cleanRoomText(body.lobbyId ?? body.lobby_id ?? body.roomId ?? body.roomCode ?? body.room_code ?? body.id ?? '', 64);
+  if (!lobbyKey) return gameError(res, 400, 'lobbyId or roomCode is required');
+  const target = await configuredGameServerTarget().catch(() => null);
+  return gameRpc(req, res, 'game_room_join', { p_lobby_key: lobbyKey, p_display_name: cleanRoomText(body.displayName ?? body.playerName ?? 'Player', 32) || 'Player', p_server_ip: target?.serverIp || null, p_server_port: target?.serverPort || null });
+});
+
+app.post('/live/lobby/leave', async (req, res) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const lobbyKey = cleanRoomText(body.lobbyId ?? body.lobby_id ?? body.roomId ?? body.roomCode ?? body.room_code ?? body.id ?? '', 64);
+  return gameRpc(req, res, 'game_room_leave', { p_lobby_key: lobbyKey || null });
+});
+
+app.post('/live/matchmaking/cancel', async (req, res) => gameRpc(req, res, 'game_matchmaking_cancel', {}));
+
 app.use('/', gameHealthRoutes);
 // The game API adapters in src use Supabase repositories and static JSON rows.
 // Existing auth/checkversion handlers above take precedence; remaining routes
