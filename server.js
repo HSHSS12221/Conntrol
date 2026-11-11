@@ -91,9 +91,75 @@ const db = {
 };
 app.use('/api', (req, res, next) => {
   if (!supabase) return res.status(503).json({ error: 'Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on the server.' });
+  // Player-facing room routes authenticate with Supabase Auth access tokens,
+  // not the admin dashboard token.
+  if (/^\/lobbies(?:\/|$)/i.test(req.path)) return next();
   if (!ADMIN_TOKEN) return res.status(503).json({ error: 'Set ADMIN_TOKEN on the server.' });
   if (req.headers.authorization !== `Bearer ${ADMIN_TOKEN}`) return res.status(401).json({ error: 'Unauthorized' });
   next();
+});
+// Application-owned lobby API. This is separate from the admin API and uses
+// each caller's Supabase Auth identity for membership and room ownership.
+app.use('/api/lobbies', async (req, res, next) => {
+  try {
+    const match = /^Bearer\s+(.+)$/i.exec(req.get('authorization') || '');
+    if (!match) return res.status(401).json({ ok: false, error: 'A Supabase access token is required.' });
+    const { data, error } = await supabase.auth.getUser(match[1]);
+    if (error || !data?.user) return res.status(401).json({ ok: false, error: 'The access token is invalid or expired.' });
+    req.roomUser = data.user;
+    next();
+  } catch (error) { next(error); }
+});
+app.post('/api/lobbies', async (req, res) => {
+  try {
+    const name = cleanRoomText(req.body?.name, 48);
+    const gameMode = cleanRoomText(req.body?.gameMode || 'default', 32);
+    const region = cleanRoomText(req.body?.region || 'auto', 24);
+    const displayName = cleanRoomText(req.body?.displayName || req.roomUser.user_metadata?.display_name || 'Player', 32);
+    const maxPlayers = Number(req.body?.maxPlayers ?? 5);
+    if (!name) return res.status(400).json({ ok: false, error: 'Room name is required.' });
+    if (!Number.isInteger(maxPlayers) || maxPlayers < 2 || maxPlayers > 16)
+      return res.status(400).json({ ok: false, error: 'maxPlayers must be an integer from 2 to 16.' });
+    const { data, error } = await supabase.rpc('room_create', {
+      p_user_id: req.roomUser.id, p_name: name, p_game_mode: gameMode,
+      p_region: region, p_max_players: maxPlayers, p_display_name: displayName,
+    });
+    if (error) return sendRoomError(res, error);
+    res.status(201).json({ ok: true, data });
+  } catch (error) { sendRoomError(res, error); }
+});
+app.get('/api/lobbies', async (req, res) => {
+  try {
+    const { data, error } = await supabase.rpc('room_search', {
+      p_user_id: req.roomUser.id,
+      p_game_mode: cleanRoomText(req.query.gameMode, 32) || null,
+      p_region: cleanRoomText(req.query.region, 24) || null,
+    });
+    if (error) return sendRoomError(res, error);
+    res.set('Cache-Control', 'no-store').json({ ok: true, data });
+  } catch (error) { sendRoomError(res, error); }
+});
+app.post('/api/lobbies/:lobbyKey/join', async (req, res) => {
+  try {
+    const displayName = cleanRoomText(req.body?.displayName || req.roomUser.user_metadata?.display_name || 'Player', 32);
+    const { data, error } = await supabase.rpc('room_join', {
+      p_user_id: req.roomUser.id,
+      p_lobby_key: cleanRoomText(req.params.lobbyKey, 64),
+      p_display_name: displayName,
+    });
+    if (error) return sendRoomError(res, error);
+    res.json({ ok: true, data });
+  } catch (error) { sendRoomError(res, error); }
+});
+app.post('/api/lobbies/:lobbyKey/leave', async (req, res) => {
+  try {
+    const { data, error } = await supabase.rpc('room_leave', {
+      p_user_id: req.roomUser.id,
+      p_lobby_key: cleanRoomText(req.params.lobbyKey, 64),
+    });
+    if (error) return sendRoomError(res, error);
+    res.json({ ok: true, data });
+  } catch (error) { sendRoomError(res, error); }
 });
 app.get('/api/logs', (req, res) => {
   const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 100));
@@ -819,6 +885,13 @@ function splitPlayerSave(value) {
 function cleanWhitelist(x = {}) { return { steam_id: String(x.steam_id || '').trim(), discord_id: String(x.discord_id || '').trim() || null, player_name: String(x.player_name || '').trim() || null, status: ['approved','pending','banned'].includes(x.status) ? x.status : 'pending', notes: String(x.notes || '').trim() || null, auth: x.auth || [], session_token: x.session_token || null, profile: x.profile || {}, coin: Number(x.coin) || 0, amethyst: Number(x.amethyst) || 0, amulet: Number(x.amulet) || 0, character_slot: x.character_slot ?? null, role: x.role || 'survivor', ban_status: x.ban_status ?? null, player_record: x.player_record ?? null, sticker_slot: x.sticker_slot ?? null, inventory: x.inventory ?? null, immortal_data: x.immortal_data || [], game_data: x.game_data && typeof x.game_data === 'object' ? x.game_data : {}, is_online: Boolean(x.is_online), last_online: x.last_online || null }; }
 function compareLauncherVersions(a, b) { const parts = value => String(value).match(/^\d+\.\d+\.\d+/)[0].split('.').map(Number); const left = parts(a), right = parts(b); for (let i = 0; i < 3; i++) if (left[i] !== right[i]) return left[i] - right[i]; return 0; }
 function cleanServer(x = {}) { return { room_name: String(x.room_name || '').trim(), host_ip: String(x.host_ip || '').trim(), port: Number(x.port) || 0, max_players: Number(x.max_players) || 0, is_online: Boolean(x.is_online), server_version: String(x.server_version || '').trim() || null, extra: x.extra && typeof x.extra === 'object' ? x.extra : {} }; }
+function cleanRoomText(value, maxLength) { if (typeof value !== 'string') return ''; return value.trim().replace(/[\u0000-\u001f\u007f]/g, '').slice(0, maxLength); }
+function sendRoomError(res, error) {
+  const message = String(error?.message || 'Room request failed');
+  const conflict = error?.code === 'P0001';
+  console.error('[lobbies]', error?.code || 'error', message);
+  return res.status(conflict ? 409 : 500).json({ ok: false, error: conflict ? message : 'Room service request failed.' });
+}
 function readBoolean(value, fallback) { if (typeof value === 'boolean') return value; if (typeof value === 'string') { if (value.toLowerCase() === 'true') return true; if (value.toLowerCase() === 'false') return false; } return fallback; }
 function gameError(res, statusCode, message) { return res.status(statusCode).json({ status: 0, data: null, error: message }); }
 function normalizeGameFieldName(value) { return String(value).replace(/[^a-z0-9]/gi, '').toLowerCase(); }
