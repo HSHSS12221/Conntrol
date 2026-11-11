@@ -837,6 +837,33 @@ app.post('/logapi/v1/add/ingame', (req, res) => {
   recordAdminLog('info', 'Game Client', `Received in-game log event; fields=${fields.join(',') || '(none)'}`, 200);
   res.status(200).json({ status: 'success' });
 });
+app.post('/logapi/v1/add/matchlog', (req, res) => {
+  // Match logs can arrive as one object or as a batch. Keep only short,
+  // non-sensitive scalar values in the diagnostic log; never store tickets,
+  // session credentials, or the full request body here.
+  const sensitiveKey = /ticket|token|secret|api[_-]?key|authorization|steam[_-]?id|discord[_-]?id/i;
+  const safeValue = value => String(value ?? '')
+    .replace(/(ticket|session[_-]?token|access[_-]?token|secret|api[_-]?key)\s*[:=]\s*[^\s,;]+/ig, '$1=[redacted]')
+    .replace(/\b(?:[a-f0-9]{40,}|eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,})\b/g, '[redacted]')
+    .replace(/[\r\n\t]+/g, ' ')
+    .slice(0, 120);
+  const entries = Array.isArray(req.body) ? req.body.slice(0, 20) : [req.body];
+  let recorded = 0;
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const details = Object.entries(entry)
+      .filter(([key, value]) => !sensitiveKey.test(key) && ['string', 'number', 'boolean'].includes(typeof value))
+      .slice(0, 8)
+      .map(([key, value]) => `${safeValue(key)}=${safeValue(value)}`);
+    const fields = Object.keys(entry).filter(key => !sensitiveKey.test(key)).slice(0, 16);
+    recordAdminLog('info', 'Match Log', details.length
+      ? details.join('; ')
+      : `Received match log event; fields=${fields.join(',') || '(none)'}`, 200);
+    recorded++;
+  }
+  if (!recorded) recordAdminLog('info', 'Match Log', 'Received match log payload with no safe scalar fields', 200);
+  res.status(200).json({ status: 'success', recorded });
+});
 // Keep unknown game routes machine-readable and visible in Admin → System Logs.
 app.use(['/live', '/logapi'], (req, res) => {
   const path = req.originalUrl.split('?')[0];
