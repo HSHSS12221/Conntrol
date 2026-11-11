@@ -397,3 +397,215 @@ grant execute on function public.room_create(uuid, text, text, text, integer, te
 grant execute on function public.room_search(uuid, text, text) to service_role;
 grant execute on function public.room_join(uuid, text, text) to service_role;
 grant execute on function public.room_leave(uuid, text) to service_role;
+
+-- Game-client rooms use SteamID64 from the verified game session. These tables
+-- are separate from game_lobbies, which belongs to the website's Supabase Auth
+-- users and has a different identity model.
+create table if not exists public.game_client_lobbies (
+  id uuid primary key default gen_random_uuid(),
+  room_code text not null unique default upper(substr(encode(gen_random_bytes(8), 'hex'), 1, 8)),
+  name text not null check (char_length(name) between 1 and 48),
+  game_mode text not null default 'default' check (char_length(game_mode) between 1 and 32),
+  region text not null default 'auto' check (char_length(region) between 1 and 24),
+  host_steam_id text not null references public.whitelists(steam_id) on delete cascade,
+  status text not null default 'waiting' check (status in ('waiting','matched','in_game','closed')),
+  max_players smallint not null default 5 check (max_players between 2 and 16),
+  server_ip text not null check (char_length(server_ip) between 1 and 255),
+  server_port integer not null check (server_port between 1 and 65535),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.game_client_lobby_members (
+  lobby_id uuid not null references public.game_client_lobbies(id) on delete cascade,
+  steam_id text not null references public.whitelists(steam_id) on delete cascade,
+  display_name text not null default 'Player' check (char_length(display_name) between 1 and 32),
+  joined_at timestamptz not null default now(),
+  left_at timestamptz,
+  primary key (lobby_id, steam_id)
+);
+
+create table if not exists public.game_matchmaking_queue (
+  steam_id text primary key references public.whitelists(steam_id) on delete cascade,
+  game_mode text not null default 'default',
+  region text not null default 'auto',
+  display_name text not null default 'Player',
+  queued_at timestamptz not null default now()
+);
+
+create index if not exists game_client_lobbies_search_idx
+  on public.game_client_lobbies(status, game_mode, region, created_at desc);
+create index if not exists game_client_lobby_members_active_idx
+  on public.game_client_lobby_members(steam_id) where left_at is null;
+create unique index if not exists game_client_lobby_one_active_per_steam
+  on public.game_client_lobby_members(steam_id) where left_at is null;
+alter table public.game_client_lobbies enable row level security;
+alter table public.game_client_lobby_members enable row level security;
+alter table public.game_matchmaking_queue enable row level security;
+revoke all on public.game_client_lobbies, public.game_client_lobby_members, public.game_matchmaking_queue from anon, authenticated;
+grant all on public.game_client_lobbies, public.game_client_lobby_members, public.game_matchmaking_queue to service_role;
+
+create or replace function public.game_room_create(
+  p_steam_id text, p_name text, p_game_mode text, p_region text,
+  p_max_players integer, p_display_name text, p_server_ip text, p_server_port integer
+) returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare v_room public.game_client_lobbies; v_display text; v_members jsonb;
+begin
+  if not exists (select 1 from public.whitelists w where w.steam_id = p_steam_id and w.status = 'approved'
+    and lower(coalesce(w.ban_status->>'permanentBanned', 'false')) not in ('true','t','1','yes')
+    and (w.ban_status->>'bannedUntil' is null or case
+      when w.ban_status->>'bannedUntil' ~ '^\d{4}-\d{2}-\d{2}([Tt ]|$)' then (w.ban_status->>'bannedUntil')::timestamptz <= now()
+      else true end)) then
+    raise exception 'Player is not approved to create rooms.' using errcode = 'P0001';
+  end if;
+  if p_server_ip is null or btrim(p_server_ip) = '' or p_server_ip ~* '^(localhost|127\.|0\.0\.0\.0|::1$)' then
+    raise exception 'A reachable game server host is required.' using errcode = 'P0001';
+  end if;
+  if p_server_port is null or p_server_port not between 1 and 65535 then raise exception 'Invalid game server port.' using errcode = 'P0001'; end if;
+  if p_max_players not between 2 and 16 then raise exception 'maxPlayers must be between 2 and 16.' using errcode = 'P0001'; end if;
+  if exists (select 1 from public.game_client_lobby_members where steam_id = p_steam_id and left_at is null) then
+    raise exception 'Leave your current room before creating another.' using errcode = 'P0001';
+  end if;
+  v_display := left(coalesce(nullif(btrim(p_display_name), ''), 'Player'), 32);
+  insert into public.game_client_lobbies(name, game_mode, region, host_steam_id, max_players, server_ip, server_port)
+  values (left(coalesce(nullif(btrim(p_name), ''), 'HSHO Room'), 48), left(coalesce(nullif(btrim(p_game_mode), ''), 'default'), 32),
+    left(coalesce(nullif(btrim(p_region), ''), 'auto'), 24), p_steam_id, p_max_players, btrim(p_server_ip), p_server_port)
+  returning * into v_room;
+  insert into public.game_client_lobby_members(lobby_id, steam_id, display_name) values (v_room.id, p_steam_id, v_display);
+  delete from public.game_matchmaking_queue where steam_id = p_steam_id;
+  select coalesce(jsonb_agg(jsonb_build_object('steamId', steam_id, 'displayName', display_name)), '[]'::jsonb)
+    into v_members from public.game_client_lobby_members where lobby_id = v_room.id and left_at is null;
+  return jsonb_build_object('state','waiting','lobby',to_jsonb(v_room),'members',v_members);
+end $$;
+
+create or replace function public.game_matchmaking_search(
+  p_steam_id text, p_game_mode text, p_region text, p_display_name text,
+  p_server_ip text default null, p_server_port integer default null
+) returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare v_room public.game_client_lobbies; v_count integer; v_display text; v_members jsonb;
+begin
+  if not exists (select 1 from public.whitelists w where w.steam_id = p_steam_id and w.status = 'approved'
+    and lower(coalesce(w.ban_status->>'permanentBanned', 'false')) not in ('true','t','1','yes')
+    and (w.ban_status->>'bannedUntil' is null or case
+      when w.ban_status->>'bannedUntil' ~ '^\d{4}-\d{2}-\d{2}([Tt ]|$)' then (w.ban_status->>'bannedUntil')::timestamptz <= now()
+      else true end)) then
+    raise exception 'Player is not approved to matchmake.' using errcode = 'P0001';
+  end if;
+  if exists (select 1 from public.game_client_lobby_members where steam_id = p_steam_id and left_at is null) then
+    select l.* into v_room from public.game_client_lobbies l join public.game_client_lobby_members m on m.lobby_id = l.id
+      where m.steam_id = p_steam_id and m.left_at is null limit 1;
+    select count(*)::integer into v_count from public.game_client_lobby_members where lobby_id = v_room.id and left_at is null;
+    select coalesce(jsonb_agg(jsonb_build_object('steamId', steam_id, 'displayName', display_name) order by joined_at), '[]'::jsonb)
+      into v_members from public.game_client_lobby_members where lobby_id = v_room.id and left_at is null;
+    return jsonb_build_object('state',case when v_room.status in ('matched','in_game') then v_room.status else 'waiting' end,
+      'lobby',to_jsonb(v_room),'members',v_members,'currentPlayers',v_count);
+  end if;
+  v_display := left(coalesce(nullif(btrim(p_display_name), ''), 'Player'), 32);
+  select l.* into v_room from public.game_client_lobbies l
+    where l.status = 'waiting' and l.game_mode = left(coalesce(nullif(btrim(p_game_mode), ''), 'default'), 32)
+      and l.region = left(coalesce(nullif(btrim(p_region), ''), 'auto'), 24)
+    order by l.created_at limit 1 for update skip locked;
+  if found then
+    select count(*)::integer into v_count from public.game_client_lobby_members where lobby_id = v_room.id and left_at is null;
+    if v_count < v_room.max_players then
+      insert into public.game_client_lobby_members(lobby_id, steam_id, display_name) values (v_room.id, p_steam_id, v_display);
+      v_count := v_count + 1;
+      if v_count >= v_room.max_players then update public.game_client_lobbies set status = 'matched', updated_at = now() where id = v_room.id returning * into v_room; end if;
+      delete from public.game_matchmaking_queue where steam_id = p_steam_id;
+      select coalesce(jsonb_agg(jsonb_build_object('steamId', steam_id, 'displayName', display_name) order by joined_at), '[]'::jsonb)
+        into v_members from public.game_client_lobby_members where lobby_id = v_room.id and left_at is null;
+      return jsonb_build_object('state',case when v_room.status = 'matched' then 'matched' else 'joined' end,
+        'lobby',to_jsonb(v_room),'members',v_members,'currentPlayers',v_count);
+    end if;
+  end if;
+  -- No open room exists yet. If the server supplied a configured reachable
+  -- endpoint, make a two-player quick-match room so the next search can join.
+  -- Without a server target, keep the player queued rather than inventing
+  -- localhost connection data.
+  if p_server_ip is not null and btrim(p_server_ip) <> '' and p_server_ip !~* '^(localhost|127\.|0\.0\.0\.0|::1$)'
+    and p_server_port between 1 and 65535 then
+    insert into public.game_client_lobbies(name, game_mode, region, host_steam_id, max_players, server_ip, server_port)
+    values ('Quick Match', left(coalesce(nullif(btrim(p_game_mode), ''), 'default'), 32),
+      left(coalesce(nullif(btrim(p_region), ''), 'auto'), 24), p_steam_id, 2, btrim(p_server_ip), p_server_port)
+    returning * into v_room;
+    insert into public.game_client_lobby_members(lobby_id, steam_id, display_name)
+      values (v_room.id, p_steam_id, v_display);
+    delete from public.game_matchmaking_queue where steam_id = p_steam_id;
+    return jsonb_build_object('state','waiting','lobby',to_jsonb(v_room),
+      'members',jsonb_build_array(jsonb_build_object('steamId',p_steam_id,'displayName',v_display)),'currentPlayers',1);
+  end if;
+  insert into public.game_matchmaking_queue(steam_id, game_mode, region, display_name)
+  values (p_steam_id, left(coalesce(nullif(btrim(p_game_mode), ''), 'default'), 32), left(coalesce(nullif(btrim(p_region), ''), 'auto'), 24), v_display)
+  on conflict (steam_id) do update set game_mode = excluded.game_mode, region = excluded.region, display_name = excluded.display_name, queued_at = now();
+  return jsonb_build_object('state','queued','queuePosition',null,'lobby',null,'members','[]'::jsonb);
+end $$;
+
+create or replace function public.game_room_join(
+  p_steam_id text, p_lobby_key text, p_display_name text,
+  p_server_ip text default null, p_server_port integer default null
+) returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare v_room public.game_client_lobbies; v_count integer; v_display text; v_members jsonb;
+begin
+  if not exists (select 1 from public.whitelists w where w.steam_id = p_steam_id and w.status = 'approved'
+    and lower(coalesce(w.ban_status->>'permanentBanned', 'false')) not in ('true','t','1','yes')
+    and (w.ban_status->>'bannedUntil' is null or case
+      when w.ban_status->>'bannedUntil' ~ '^\d{4}-\d{2}-\d{2}([Tt ]|$)' then (w.ban_status->>'bannedUntil')::timestamptz <= now()
+      else true end)) then
+    raise exception 'Player is not approved to join rooms.' using errcode = 'P0001';
+  end if;
+  select * into v_room from public.game_client_lobbies where id::text = p_lobby_key or room_code = upper(p_lobby_key) for update;
+  if not found then raise exception 'Room not found.' using errcode = 'P0001'; end if;
+  if v_room.status <> 'waiting' then raise exception 'Room is not open.' using errcode = 'P0001'; end if;
+  if exists (select 1 from public.game_client_lobby_members where steam_id = p_steam_id and left_at is null and lobby_id <> v_room.id) then
+    raise exception 'Leave your current room before joining another.' using errcode = 'P0001';
+  end if;
+  select count(*)::integer into v_count from public.game_client_lobby_members where lobby_id = v_room.id and left_at is null;
+  if not exists (select 1 from public.game_client_lobby_members where lobby_id = v_room.id and steam_id = p_steam_id and left_at is null)
+    and v_count >= v_room.max_players then raise exception 'Room is full.' using errcode = 'P0001'; end if;
+  v_display := left(coalesce(nullif(btrim(p_display_name), ''), 'Player'), 32);
+  insert into public.game_client_lobby_members(lobby_id, steam_id, display_name) values (v_room.id, p_steam_id, v_display)
+    on conflict (lobby_id, steam_id) do update set display_name = excluded.display_name, joined_at = now(), left_at = null;
+  select count(*)::integer into v_count from public.game_client_lobby_members where lobby_id = v_room.id and left_at is null;
+  if v_count >= v_room.max_players then update public.game_client_lobbies set status = 'matched', updated_at = now() where id = v_room.id returning * into v_room; end if;
+  delete from public.game_matchmaking_queue where steam_id = p_steam_id;
+  select coalesce(jsonb_agg(jsonb_build_object('steamId', steam_id, 'displayName', display_name) order by joined_at), '[]'::jsonb)
+    into v_members from public.game_client_lobby_members where lobby_id = v_room.id and left_at is null;
+  return jsonb_build_object('state',case when v_room.status = 'matched' then 'matched' else 'joined' end,
+    'lobby',to_jsonb(v_room),'members',v_members,'currentPlayers',v_count);
+end $$;
+
+create or replace function public.game_room_leave(p_steam_id text, p_lobby_key text default null)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare v_room public.game_client_lobbies; v_next_host text;
+begin
+  select l.* into v_room from public.game_client_lobbies l join public.game_client_lobby_members m on m.lobby_id = l.id
+    where m.steam_id = p_steam_id and m.left_at is null and (p_lobby_key is null or l.id::text = p_lobby_key or l.room_code = upper(p_lobby_key)) for update of l limit 1;
+  if not found then return jsonb_build_object('state','not_in_room','left',false); end if;
+  update public.game_client_lobby_members set left_at = now() where lobby_id = v_room.id and steam_id = p_steam_id and left_at is null;
+  if v_room.host_steam_id = p_steam_id then
+    select steam_id into v_next_host from public.game_client_lobby_members where lobby_id = v_room.id and left_at is null order by joined_at limit 1;
+    if v_next_host is null then update public.game_client_lobbies set status = 'closed', updated_at = now() where id = v_room.id returning * into v_room;
+    else update public.game_client_lobbies set host_steam_id = v_next_host, status = 'waiting', updated_at = now() where id = v_room.id returning * into v_room; end if;
+  else update public.game_client_lobbies set status = 'waiting', updated_at = now() where id = v_room.id returning * into v_room; end if;
+  return jsonb_build_object('state','left','left',true,'lobbyId',v_room.id);
+end $$;
+
+create or replace function public.game_matchmaking_cancel(p_steam_id text)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare v_deleted integer;
+begin
+  delete from public.game_matchmaking_queue where steam_id = p_steam_id;
+  get diagnostics v_deleted = row_count;
+  return jsonb_build_object('state','cancelled','cancelled',v_deleted > 0);
+end $$;
+
+revoke all on function public.game_room_create(text,text,text,text,integer,text,text,integer) from public, anon, authenticated;
+revoke all on function public.game_matchmaking_search(text,text,text,text,text,integer) from public, anon, authenticated;
+revoke all on function public.game_room_join(text,text,text,text,integer) from public, anon, authenticated;
+revoke all on function public.game_room_leave(text,text) from public, anon, authenticated;
+revoke all on function public.game_matchmaking_cancel(text) from public, anon, authenticated;
+grant execute on function public.game_room_create(text,text,text,text,integer,text,text,integer) to service_role;
+grant execute on function public.game_matchmaking_search(text,text,text,text,text,integer) to service_role;
+grant execute on function public.game_room_join(text,text,text,text,integer) to service_role;
+grant execute on function public.game_room_leave(text,text) to service_role;
+grant execute on function public.game_matchmaking_cancel(text) to service_role;
