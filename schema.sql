@@ -213,3 +213,187 @@ grant all on public.launcher_login_sessions to service_role;
 grant all on public.discord_settings, public.discord_verification_guides to service_role;
 revoke all on public.launcher_command_deliveries from anon, authenticated;
 grant all on public.launcher_command_deliveries to service_role;
+
+
+-- Application-owned room/lobby API (Supabase Auth users; independent of the game protocol).
+create extension if not exists pgcrypto;
+
+create table if not exists public.game_lobbies (
+  id uuid primary key default gen_random_uuid(),
+  room_code text not null unique default upper(substr(encode(gen_random_bytes(8), 'hex'), 1, 8)),
+  name text not null check (char_length(name) between 1 and 48),
+  game_mode text not null default 'default' check (char_length(game_mode) between 1 and 32),
+  region text not null default 'auto' check (char_length(region) between 1 and 24),
+  host_user_id uuid not null references auth.users(id) on delete cascade,
+  status text not null default 'waiting' check (status in ('waiting', 'in_game', 'closed')),
+  max_players smallint not null default 5 check (max_players between 2 and 16),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.game_lobby_members (
+  lobby_id uuid not null references public.game_lobbies(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  display_name text not null default 'Player' check (char_length(display_name) between 1 and 32),
+  joined_at timestamptz not null default now(),
+  left_at timestamptz,
+  primary key (lobby_id, user_id)
+);
+
+create index if not exists game_lobbies_search_idx
+  on public.game_lobbies (status, game_mode, region, created_at desc);
+create index if not exists game_lobby_members_active_idx
+  on public.game_lobby_members (user_id) where left_at is null;
+create unique index if not exists game_lobby_one_active_room_per_user
+  on public.game_lobby_members (user_id) where left_at is null;
+
+alter table public.game_lobbies enable row level security;
+alter table public.game_lobby_members enable row level security;
+grant all on public.game_lobbies, public.game_lobby_members to service_role;
+
+create or replace function public.room_create(
+  p_user_id uuid,
+  p_name text,
+  p_game_mode text,
+  p_region text,
+  p_max_players integer,
+  p_display_name text
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_room public.game_lobbies;
+begin
+  if exists (select 1 from public.game_lobby_members where user_id = p_user_id and left_at is null) then
+    raise exception 'You already belong to an active room.' using errcode = 'P0001';
+  end if;
+
+  insert into public.game_lobbies(name, game_mode, region, host_user_id, max_players)
+  values (left(trim(p_name), 48), left(trim(p_game_mode), 32), left(trim(p_region), 24), p_user_id, p_max_players)
+  returning * into v_room;
+
+  insert into public.game_lobby_members(lobby_id, user_id, display_name)
+  values (v_room.id, p_user_id, left(trim(p_display_name), 32));
+
+  return jsonb_build_object(
+    'lobby', to_jsonb(v_room),
+    'members', jsonb_build_array(jsonb_build_object('userId', p_user_id, 'displayName', left(trim(p_display_name), 32)))
+  );
+end;
+$$;
+
+create or replace function public.room_search(
+  p_user_id uuid,
+  p_game_mode text default null,
+  p_region text default null
+) returns jsonb
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select jsonb_build_object('lobbies', coalesce(jsonb_agg(to_jsonb(found)), '[]'::jsonb))
+  from (
+    select l.id, l.room_code, l.name, l.game_mode, l.region, l.host_user_id,
+           l.max_players, count(m.user_id)::integer as current_players, l.created_at
+    from public.game_lobbies l
+    left join public.game_lobby_members m on m.lobby_id = l.id and m.left_at is null
+    where l.status = 'waiting'
+      and (p_game_mode is null or l.game_mode = p_game_mode)
+      and (p_region is null or l.region = p_region)
+    group by l.id
+    having count(m.user_id) < l.max_players
+    order by l.created_at desc
+    limit 100
+  ) found;
+$$;
+
+create or replace function public.room_join(
+  p_user_id uuid,
+  p_lobby_key text,
+  p_display_name text
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_room public.game_lobbies;
+  v_count integer;
+  v_members jsonb;
+begin
+  select * into v_room from public.game_lobbies
+  where id::text = p_lobby_key or room_code = upper(p_lobby_key)
+  for update;
+  if not found then raise exception 'Room not found.' using errcode = 'P0001'; end if;
+  if v_room.status <> 'waiting' then raise exception 'Room is not open.' using errcode = 'P0001'; end if;
+  if exists (select 1 from public.game_lobby_members where user_id = p_user_id and left_at is null and lobby_id <> v_room.id) then
+    raise exception 'Leave your current room before joining another.' using errcode = 'P0001';
+  end if;
+
+  select count(*)::integer into v_count from public.game_lobby_members where lobby_id = v_room.id and left_at is null;
+  if not exists (select 1 from public.game_lobby_members where lobby_id = v_room.id and user_id = p_user_id and left_at is null)
+     and v_count >= v_room.max_players then
+    raise exception 'Room is full.' using errcode = 'P0001';
+  end if;
+
+  insert into public.game_lobby_members(lobby_id, user_id, display_name, left_at)
+  values (v_room.id, p_user_id, left(trim(p_display_name), 32), null)
+  on conflict (lobby_id, user_id) do update
+    set display_name = excluded.display_name, joined_at = now(), left_at = null;
+
+  select coalesce(jsonb_agg(jsonb_build_object('userId', user_id, 'displayName', display_name) order by joined_at), '[]'::jsonb)
+  into v_members from public.game_lobby_members where lobby_id = v_room.id and left_at is null;
+  return jsonb_build_object('lobby', to_jsonb(v_room), 'members', v_members);
+end;
+$$;
+
+create or replace function public.room_leave(
+  p_user_id uuid,
+  p_lobby_key text
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_room public.game_lobbies;
+  v_next_host uuid;
+begin
+  select * into v_room from public.game_lobbies
+  where id::text = p_lobby_key or room_code = upper(p_lobby_key)
+  for update;
+  if not found then raise exception 'Room not found.' using errcode = 'P0001'; end if;
+  if not exists (select 1 from public.game_lobby_members where lobby_id = v_room.id and user_id = p_user_id and left_at is null) then
+    raise exception 'You are not a member of this room.' using errcode = 'P0001';
+  end if;
+
+  update public.game_lobby_members set left_at = now()
+  where lobby_id = v_room.id and user_id = p_user_id and left_at is null;
+
+  if v_room.host_user_id = p_user_id then
+    select user_id into v_next_host from public.game_lobby_members
+    where lobby_id = v_room.id and left_at is null order by joined_at limit 1;
+    if v_next_host is null then
+      update public.game_lobbies set status = 'closed', updated_at = now() where id = v_room.id returning * into v_room;
+    else
+      update public.game_lobbies set host_user_id = v_next_host, updated_at = now() where id = v_room.id returning * into v_room;
+    end if;
+  else
+    update public.game_lobbies set updated_at = now() where id = v_room.id returning * into v_room;
+  end if;
+
+  return jsonb_build_object('lobby', to_jsonb(v_room), 'left', true);
+end;
+$$;
+
+revoke all on function public.room_create(uuid, text, text, text, integer, text) from public, anon, authenticated;
+revoke all on function public.room_search(uuid, text, text) from public, anon, authenticated;
+revoke all on function public.room_join(uuid, text, text) from public, anon, authenticated;
+revoke all on function public.room_leave(uuid, text) from public, anon, authenticated;
+grant execute on function public.room_create(uuid, text, text, text, integer, text) to service_role;
+grant execute on function public.room_search(uuid, text, text) to service_role;
+grant execute on function public.room_join(uuid, text, text) to service_role;
+grant execute on function public.room_leave(uuid, text) to service_role;
