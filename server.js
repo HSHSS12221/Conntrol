@@ -849,9 +849,17 @@ function unwrapGameSavePayload(body) {
 }
 function pickGameSaveValue(payload, names) {
   for (const name of names) if (Object.hasOwn(payload, name)) return payload[name];
-  const wanted = new Set(names.map(normalizeGameFieldName));
-  for (const [key, value] of Object.entries(payload)) if (wanted.has(normalizeGameFieldName(key))) return value;
+  for (const [key, value] of Object.entries(payload)) if (names.some(name => matchesGameSaveField(key, name))) return value;
   return undefined;
+}
+// Unreal export JSON names user-defined struct fields like
+// `DefaultCharacter_58_A0FB...` (field index + 32-character GUID). Runtime
+// JSON often uses the clean name, so accept both forms while requiring the
+// exact Unreal suffix shape to avoid accidentally matching unrelated keys.
+function matchesGameSaveField(candidate, expected) {
+  const actual = normalizeGameFieldName(candidate);
+  const base = normalizeGameFieldName(expected);
+  return actual === base || new RegExp(`^${base}\\d+[a-f0-9]{32}$`).test(actual);
 }
 // PlayerSaveGame.json is an Unreal export. These are the client-owned
 // appearance/loadout fields from its S_PlayerInfo struct that can safely be
@@ -865,7 +873,7 @@ const PLAYER_SAVEGAME_CUSTOMIZATION_FIELDS = new Set([
 ]);
 function extractPlayerSaveGameCustomization(payload) {
   const source = pickGameSaveValue(payload, ['S_PlayerInfo','s_player_info','PlayerSaveGame','playerSaveGame','playerInfo','PlayerInfo'])
-    ?? (payload.Properties || payload.properties || Object.keys(payload).some(key => PLAYER_SAVEGAME_CUSTOMIZATION_FIELDS.has(key)) ? payload : null);
+    ?? (payload.Properties || payload.properties || Object.keys(payload).some(key => [...PLAYER_SAVEGAME_CUSTOMIZATION_FIELDS].some(field => matchesGameSaveField(key, field))) ? payload : null);
   if (!source || typeof source !== 'object' || Array.isArray(source)) return null;
   // Support the exported Unreal shape ({ Properties: { S_PlayerInfo: ... } })
   // as well as the runtime shape (the struct object itself).
@@ -874,9 +882,10 @@ function extractPlayerSaveGameCustomization(payload) {
   if (!info || typeof info !== 'object' || Array.isArray(info)) return null;
   const customization = {};
   for (const [key, value] of Object.entries(info)) {
-    if (!PLAYER_SAVEGAME_CUSTOMIZATION_FIELDS.has(key)) continue;
+    const canonicalField = [...PLAYER_SAVEGAME_CUSTOMIZATION_FIELDS].find(field => matchesGameSaveField(key, field));
+    if (!canonicalField) continue;
     if (Buffer.byteLength(JSON.stringify(value), 'utf8') > 200 * 1024) throw new Error(`${key} is too large`);
-    customization[key] = safeGameSnapshot(value);
+    customization[canonicalField] = safeGameSnapshot(value);
   }
   return Object.keys(customization).length ? customization : null;
 }
