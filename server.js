@@ -851,9 +851,47 @@ function pickGameSaveValue(payload, names) {
   for (const [key, value] of Object.entries(payload)) if (wanted.has(normalizeGameFieldName(key))) return value;
   return undefined;
 }
+// PlayerSaveGame.json is an Unreal export. These are the client-owned
+// appearance/loadout fields from its S_PlayerInfo struct that can safely be
+// persisted as JSONB. Identity, wallet, ownership, and inventory remain
+// server-authoritative and are intentionally excluded.
+const PLAYER_SAVEGAME_CUSTOMIZATION_FIELDS = new Set([
+  'DefaultCharacter','CharacterItem','CharacterHunterItem','StickerPreset',
+  'SurvivorSlots','HunterSlots','StickerAssets','FrameImage',
+  'PlayerCharacterInfo','CurseSlots','RelicSlots',
+  'PlayerRecordHunter','PlayerRecordSurvivor','PlayerRecord4v4',
+]);
+function extractPlayerSaveGameCustomization(payload) {
+  const source = pickGameSaveValue(payload, ['S_PlayerInfo','s_player_info','PlayerSaveGame','playerSaveGame','playerInfo','PlayerInfo'])
+    ?? (payload.Properties || payload.properties || Object.keys(payload).some(key => PLAYER_SAVEGAME_CUSTOMIZATION_FIELDS.has(key)) ? payload : null);
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return null;
+  // Support the exported Unreal shape ({ Properties: { S_PlayerInfo: ... } })
+  // as well as the runtime shape (the struct object itself).
+  const properties = source.Properties ?? source.properties ?? source;
+  const info = properties.S_PlayerInfo ?? properties.s_player_info ?? properties;
+  if (!info || typeof info !== 'object' || Array.isArray(info)) return null;
+  const customization = {};
+  for (const [key, value] of Object.entries(info)) {
+    if (!PLAYER_SAVEGAME_CUSTOMIZATION_FIELDS.has(key)) continue;
+    if (Buffer.byteLength(JSON.stringify(value), 'utf8') > 200 * 1024) throw new Error(`${key} is too large`);
+    customization[key] = safeGameSnapshot(value);
+  }
+  return Object.keys(customization).length ? customization : null;
+}
 async function persistGameCustomization(player, requestBody) {
   const payload = unwrapGameSavePayload(requestBody);
   const updates = {};
+  const saveGameCustomization = extractPlayerSaveGameCustomization(payload);
+  if (saveGameCustomization) {
+    const previous = player.PlayerSaveGame && typeof player.PlayerSaveGame === 'object' && !Array.isArray(player.PlayerSaveGame)
+      ? player.PlayerSaveGame : {};
+    player.PlayerSaveGame = { ...previous, ...saveGameCustomization };
+    updates.PlayerSaveGame = Object.keys(saveGameCustomization);
+    // Mirror received Unreal fields as top-level game data too. Auth response
+    // construction restores game_data onto the player object, so clients that
+    // request these legacy keys continue to receive them on the next login.
+    for (const [key, value] of Object.entries(saveGameCustomization)) player[key] = value;
+  }
   const slotValue = pickGameSaveValue(payload, ['characterSlot','character_slot','slots']);
   const loadout = pickGameSaveValue(payload, ['loadout','Loadout']);
   const slotKeys = ['hunterSlot','survivorSlot','characterhunteritem','characteritem','character'];
@@ -890,10 +928,12 @@ async function persistGameCustomization(player, requestBody) {
     ['loadout', ['loadout','Loadout']],
     ['equippedSkins', ['equippedSkins','equipped_skins']],
     ['selectedCharacter', ['selectedCharacter','selected_character']],
+    ['PlayerSaveGame', ['PlayerSaveGame','playerSaveGame','S_PlayerInfo','s_player_info','playerInfo','PlayerInfo']],
   ];
   for (const [storedKey, aliases] of customizationFields) {
     const value = pickGameSaveValue(payload, aliases);
     if (value === undefined || (storedKey === 'loadout' && loadoutIsSlotData)) continue;
+    if (storedKey === 'PlayerSaveGame' && saveGameCustomization) continue;
     const scalarCharacter = storedKey === 'selectedCharacter' && ['string','number'].includes(typeof value);
     if (value === null || (!scalarCharacter && typeof value !== 'object') || Buffer.byteLength(JSON.stringify(value), 'utf8') > 200 * 1024) {
       throw new Error(`${storedKey} must be JSON data under 200 KB`);
@@ -1005,10 +1045,20 @@ app.post('/api/savePlayerData', async (req, res) => {
 
       // Store additional non-reserved game fields in JSONB, without allowing
       // callers to smuggle identity, credentials, economy, or moderation fields.
-      const protectedKeys = /^(steam_?id|auth|session_?token|access_?token|status|ban_?status|inventory|coin|amethyst|amulet|role|is_?online|last_?online)$/i;
+      const protectedKeys = /^(steam_?id|csteamid|playerid|playersessionid|auth|session_?token|access_?token|status|ban_?status|inventory|playerinventoryinfo|characterlist|coin|gem|token|lootboxamount|amethyst|amulet|role|is_?online|last_?online)$/i;
       const extras = Object.fromEntries(Object.entries(split.game_data || {}).filter(([key]) => !protectedKeys.test(key)));
       if (Object.keys(extras).length) {
-        for (const [key, value] of Object.entries(extras)) player[key] = value;
+        for (const [key, value] of Object.entries(extras)) {
+          if (/^(playersavegame|s_player_info|playerinfo)$/i.test(key)) {
+            const customization = extractPlayerSaveGameCustomization({ [key]: value });
+            if (customization) {
+              player.PlayerSaveGame = { ...(player.PlayerSaveGame || {}), ...customization };
+              Object.assign(player, customization);
+            }
+            continue;
+          }
+          player[key] = value;
+        }
         await player.save();
       }
 
