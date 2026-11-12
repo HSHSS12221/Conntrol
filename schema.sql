@@ -599,13 +599,61 @@ begin
   return jsonb_build_object('state','cancelled','cancelled',v_deleted > 0);
 end $$;
 
+-- Read-only snapshot for clients that poll after search/join. This reports the
+-- app-owned queue/lobby state; it is not a GameLift PlayerSession response.
+create or replace function public.game_matchmaking_status(p_steam_id text)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  v_room public.game_client_lobbies;
+  v_members jsonb;
+  v_count integer;
+  v_position integer;
+begin
+  if not exists (select 1 from public.whitelists w where w.steam_id = p_steam_id and w.status = 'approved'
+    and lower(coalesce(w.ban_status->>'permanentBanned', 'false')) not in ('true','t','1','yes')
+    and (w.ban_status->>'bannedUntil' is null or case
+      when w.ban_status->>'bannedUntil' ~ '^\d{4}-\d{2}-\d{2}([Tt ]|$)' then (w.ban_status->>'bannedUntil')::timestamptz <= now()
+      else true end)) then
+    raise exception 'Player is not approved to check matchmaking status.' using errcode = 'P0001';
+  end if;
+
+  select l.* into v_room
+    from public.game_client_lobbies l
+    join public.game_client_lobby_members m on m.lobby_id = l.id
+   where m.steam_id = p_steam_id and m.left_at is null
+   order by m.joined_at desc
+   limit 1;
+  if found then
+    select count(*)::integer into v_count from public.game_client_lobby_members where lobby_id = v_room.id and left_at is null;
+    select coalesce(jsonb_agg(jsonb_build_object('steamId', steam_id, 'displayName', display_name) order by joined_at), '[]'::jsonb)
+      into v_members from public.game_client_lobby_members where lobby_id = v_room.id and left_at is null;
+    return jsonb_build_object(
+      'state', case when v_room.status in ('matched','in_game') then v_room.status else 'waiting' end,
+      'lobby', to_jsonb(v_room), 'lobbyId', v_room.id, 'roomId', v_room.room_code,
+      'members', v_members, 'currentPlayers', v_count, 'maxPlayers', v_room.max_players
+    );
+  end if;
+
+  if exists (select 1 from public.game_matchmaking_queue q where q.steam_id = p_steam_id) then
+    select (count(*) + 1)::integer into v_position
+      from public.game_matchmaking_queue q
+      join public.game_matchmaking_queue mine on mine.steam_id = p_steam_id
+     where q.game_mode = mine.game_mode and q.region = mine.region and q.queued_at < mine.queued_at;
+    return jsonb_build_object('state','queued','queuePosition',coalesce(v_position,1),'lobby',null,'members','[]'::jsonb);
+  end if;
+
+  return jsonb_build_object('state','idle','queuePosition',null,'lobby',null,'members','[]'::jsonb);
+end $$;
+
 revoke all on function public.game_room_create(text,text,text,text,integer,text,text,integer) from public, anon, authenticated;
 revoke all on function public.game_matchmaking_search(text,text,text,text,text,integer) from public, anon, authenticated;
 revoke all on function public.game_room_join(text,text,text,text,integer) from public, anon, authenticated;
 revoke all on function public.game_room_leave(text,text) from public, anon, authenticated;
 revoke all on function public.game_matchmaking_cancel(text) from public, anon, authenticated;
+revoke all on function public.game_matchmaking_status(text) from public, anon, authenticated;
 grant execute on function public.game_room_create(text,text,text,text,integer,text,text,integer) to service_role;
 grant execute on function public.game_matchmaking_search(text,text,text,text,text,integer) to service_role;
 grant execute on function public.game_room_join(text,text,text,text,integer) to service_role;
 grant execute on function public.game_room_leave(text,text) to service_role;
 grant execute on function public.game_matchmaking_cancel(text) to service_role;
+grant execute on function public.game_matchmaking_status(text) to service_role;
