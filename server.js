@@ -715,14 +715,14 @@ function normalizeGameLobbyResult(value, serverTarget) {
   };
 }
 
-async function gameRpc(req, res, rpcName, args, { requireServer = false } = {}) {
+async function gameRpc(req, res, rpcName, args, { requireServer = false, includeServerTarget = true } = {}) {
   try {
     if (!supabase) return gameError(res, 503, 'Game database is not configured');
     await respondWithAuthedGamePlayer(req, res, async player => {
-      const serverTarget = await configuredGameServerTarget();
+      const serverTarget = includeServerTarget || requireServer ? await configuredGameServerTarget() : null;
       if (requireServer && !serverTarget) return gameError(res, 503, 'Dedicated game server host and port are not configured');
       const { data, error } = await supabase.rpc(rpcName, { p_steam_id: player.steamId, ...args,
-        ...(serverTarget ? { p_server_ip: serverTarget.serverIp, p_server_port: serverTarget.serverPort } : {}) });
+        ...(includeServerTarget && serverTarget ? { p_server_ip: serverTarget.serverIp, p_server_port: serverTarget.serverPort } : {}) });
       if (error) {
         recordAdminLog('warn', 'Matchmaking', `${rpcName} failed (${error.code || 'database error'})`, 409);
         return gameError(res, error.code === 'P0001' ? 409 : 503, error.code === 'P0001' ? cleanRoomText(error.message, 120) : 'Matchmaking request failed');
@@ -801,10 +801,12 @@ app.post('/live/lobby/join', async (req, res) => {
 app.post('/live/lobby/leave', async (req, res) => {
   const body = req.body && typeof req.body === 'object' ? req.body : {};
   const lobbyKey = cleanRoomText(body.lobbyId ?? body.lobby_id ?? body.roomId ?? body.roomCode ?? body.room_code ?? body.id ?? '', 64);
-  return gameRpc(req, res, 'game_room_leave', { p_lobby_key: lobbyKey || null });
+  return gameRpc(req, res, 'game_room_leave', { p_lobby_key: lobbyKey || null }, { includeServerTarget: false });
 });
 
-app.post('/live/matchmaking/cancel', async (req, res) => gameRpc(req, res, 'game_matchmaking_cancel', {}));
+app.post('/live/matchmaking/cancel', async (req, res) => gameRpc(req, res, 'game_matchmaking_cancel', {}, { includeServerTarget: false }));
+app.post(['/live/matchmaking/status', '/live/lobby/status'], async (req, res) =>
+  gameRpc(req, res, 'game_matchmaking_status', {}, { includeServerTarget: false }));
 
 app.use('/', gameHealthRoutes);
 // The game API adapters in src use Supabase repositories and static JSON rows.
