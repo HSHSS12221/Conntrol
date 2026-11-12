@@ -33,27 +33,42 @@ app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 const adminLogs = [];
-function recordAdminLog(level, source, message, status = null) {
-  adminLogs.unshift({ at: new Date().toISOString(), level, source, message: String(message).slice(0, 240), status });
+function recordAdminLog(level, source, message, status = null, game = null) {
+  if (!game && /^(Game API|Game Client|Steam Auth|Game Error|Match Log|Matchmaking|Player Save)$/.test(source)) {
+    game = { name: 'Home Sweet Home Online', client: 'server-side event' };
+  }
+  adminLogs.unshift({ at: new Date().toISOString(), level, source, message: String(message).slice(0, 1200), status, game });
   if (adminLogs.length > 300) adminLogs.length = 300;
 }
 app.use((req, res, next) => {
   const requestPath = req.path;
   if (!/^\/(?:live|logapi)\//i.test(requestPath)) return next();
+  const logPath = sanitizeGamePath(requestPath);
   const startedAt = Date.now();
   const isLiveRequest = /^\/live\//i.test(requestPath);
-  // Log only safe metadata and field names. Game auth payloads may contain
-  // Steam tickets, session tokens, or personal identifiers; never dump values.
-  const fields = isLiveRequest ? listSafeGameFieldNames(req.body) : [];
-  if (isLiveRequest) {
-    console.info(`[Game API] <- ${req.method} ${requestPath}; content-type=${String(req.get('content-type') || 'missing').slice(0, 80)}; content-length=${String(req.get('content-length') || 'unknown')}; fields=${fields.join(',') || '(none)'}`);
+  const isGameRequest = isLiveRequest || /^\/logapi\//i.test(requestPath);
+  const game = isGameRequest ? identifyGameClient(req) : null;
+  // Record shape and field names only. Never record payload values: game auth
+  // requests may contain Steam tickets, JWTs, account IDs, or session secrets.
+  const requestShape = isGameRequest ? describeGamePayloadShape(req.body) : [];
+  const queryFields = isGameRequest ? [...new Set(Object.keys(req.query || {}))].slice(0, 20) : [];
+  let responseShape = [];
+  if (isGameRequest) {
+    const sendJson = res.json.bind(res);
+    res.json = payload => {
+      responseShape = describeGamePayloadShape(payload);
+      return sendJson(payload);
+    };
+    console.info(`[HSHO] <- ${req.method} ${logPath}; client=${game.client}; content-type=${String(req.get('content-type') || 'missing').slice(0, 80)}; request=${requestShape.join(',') || '(empty)'}; query=${queryFields.join(',') || '(none)'}`);
   }
   res.once('finish', () => {
     const elapsed = Date.now() - startedAt;
     const level = res.statusCode >= 400 ? 'warn' : 'info';
-    const summary = `${req.method} ${requestPath} -> HTTP ${res.statusCode} (${elapsed}ms)${isLiveRequest ? `; fields=${fields.join(',') || '(none)'}` : ''}`;
-    recordAdminLog(level, 'Game API', summary, res.statusCode);
-    if (isLiveRequest) console.info(`[Game API] -> ${req.method} ${requestPath}; HTTP ${res.statusCode}; ${elapsed}ms`);
+    const responseType = String(res.getHeader('content-type') || 'unknown').split(';', 1)[0];
+    const diagnosis = diagnoseGameHttpResult(res.statusCode, responseShape);
+    const summary = `${req.method} ${logPath} -> HTTP ${res.statusCode} (${elapsed}ms); request=${requestShape.join(',') || '(empty)'}; response=${responseShape.join(',') || '(shape unavailable)'}; response-type=${responseType}; query=${queryFields.join(',') || '(none)'}${diagnosis ? `; diagnosis=${diagnosis}` : ''}`;
+    recordAdminLog(level, isLiveRequest ? 'Game API' : 'Game Client', summary, res.statusCode, game);
+    if (isGameRequest) console.info(`[HSHO] -> ${req.method} ${logPath}; HTTP ${res.statusCode}; response=${responseShape.join(',') || '(shape unavailable)'}; ${elapsed}ms`);
   });
   next();
 });
@@ -1109,8 +1124,8 @@ app.post('/logapi/v1/add/matchlog', (req, res) => {
 });
 // Keep unknown game routes machine-readable and visible in Admin → System Logs.
 app.use(['/live', '/logapi'], (req, res) => {
-  const path = req.originalUrl.split('?')[0];
-  recordAdminLog('warn', 'Game API', `No handler registered for ${req.method} ${path}`, 404);
+  const path = sanitizeGamePath(req.originalUrl.split('?')[0]);
+  recordAdminLog('warn', 'Game API', `No handler registered for ${req.method} ${path}`, 404, identifyGameClient(req));
   gameError(res, 404, `Game API endpoint is not implemented: ${req.method} ${path}`);
 });
 app.use((err, req, res, next) => { console.error(err); res.status(400).json({ error: err.message || 'Request failed' }); });
@@ -1183,6 +1198,59 @@ function findGameAuthField(root, names, depth = 0) {
     }
   }
   return undefined;
+}
+function identifyGameClient(req) {
+  const clean = value => String(value || '').replace(/[\r\n\t\x00-\x1f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100);
+  const explicit = clean(req.get('x-game-name') || req.get('x-client-name') || req.get('x-game-client'));
+  const userAgent = clean(req.get('user-agent'));
+  return { name: 'Home Sweet Home Online', client: explicit || userAgent || 'client name not reported' };
+}
+function sanitizeGamePath(value) {
+  return String(value || '')
+    .replace(/\d{17,}/g, '[numeric-id]')
+    .replace(/eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}(?:\.[A-Za-z0-9_-]{12,})?/g, '[redacted-token]')
+    .slice(0, 240);
+}
+function diagnoseGameHttpResult(status, responseShape = []) {
+  if (status === 400) return 'ตรวจ Content-Type และฟิลด์ที่ request ส่งมา; server ปฏิเสธรูปแบบหรือข้อมูล';
+  if (status === 401 || status === 403) return 'ตรวจ Steam ticket/session, whitelist และสิทธิ์ของผู้เล่น';
+  if (status === 404) return 'ไม่มี handler สำหรับ method/path นี้ หรือ route ไม่ตรง';
+  if (status === 405) return 'ตรวจ HTTP method ที่เกมเรียกกับ method ที่ route รองรับ';
+  if (status === 413) return 'request ใหญ่เกินขีดจำกัด body ของ server';
+  if (status === 429) return 'ถูกจำกัดจำนวน request; ตรวจ rate limit/retry';
+  if (status >= 500) return 'เกิดข้อผิดพลาดฝั่ง server; ตรวจ Render application logs/Supabase error';
+  if (status >= 200 && status < 300 && !responseShape.length) return 'HTTP ผ่าน แต่ไม่พบ JSON response shape ให้ตรวจว่า endpoint ตอบ body กลับหรือไม่';
+  return '';
+}
+function describeGamePayloadShape(root, maxItems = 24) {
+  const result = [];
+  const sensitive = /ticket|token|secret|api[_-]?key|authorization|steam[_-]?id|discord[_-]?id|password/i;
+  const visit = (value, prefix = '', depth = 0) => {
+    if (result.length >= maxItems || depth > 4) return;
+    if (value === null || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      result.push(`${prefix || 'body'}:array[${value.length}]`);
+      if (depth < 2 && value.length && value[0] && typeof value[0] === 'object') visit(value[0], `${prefix || 'body'}[]`, depth + 1);
+      return;
+    }
+    for (const [rawKey, child] of Object.entries(value)) {
+      if (result.length >= maxItems) break;
+      const key = String(rawKey).replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 40);
+      if (!key) continue;
+      const field = prefix ? `${prefix}.${key}` : key;
+      if (sensitive.test(key)) { result.push(`${field}:[present; value hidden]`); continue; }
+      if (child === null) result.push(`${field}:null`);
+      else if (Array.isArray(child)) {
+        result.push(`${field}:array[${child.length}]`);
+        if (depth < 2 && child.length && child[0] && typeof child[0] === 'object') visit(child[0], `${field}[]`, depth + 1);
+      } else if (typeof child === 'object') {
+        result.push(`${field}:object`);
+        visit(child, field, depth + 1);
+      } else result.push(`${field}:${typeof child}`);
+    }
+  };
+  visit(root);
+  return result;
 }
 function listSafeGameFieldNames(root, depth = 0) {
   if (depth > 4 || !root || typeof root !== 'object') return [];
