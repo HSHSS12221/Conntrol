@@ -582,22 +582,22 @@ const handleSteamGameAuth = async (req, res) => {
     player.auth = updatedAuth;
     player.session_token = sessionToken;
     player.profile = { ...player.profile, ...(saved.profile || {}), displayName: saved.player_name || saved.profile?.displayName || `Player_${steamId.slice(-6)}`, updatedAt: now };
-    const savedSlots = saved.character_slot && typeof saved.character_slot === 'object' ? saved.character_slot : null;
-    const hasSavedLoadouts = savedSlots && (
-      (Array.isArray(savedSlots.hunterSlot) && savedSlots.hunterSlot.length > 0) ||
-      (Array.isArray(savedSlots.survivorSlot) && savedSlots.survivorSlot.length > 0)
-    );
-    player.characterSlot = hasSavedLoadouts ? savedSlots : (playerData.characterSlot || player.characterSlot);
-    player.role = playerData.role || saved.role || player.role;
-    player.stickerSlot = playerData.stickerSlot || saved.sticker_slot || player.stickerSlot;
-    player.inventory = toLegacyInventory(playerData.inventory || saved.inventory, player.inventory);
+    const savedSlots = saved.character_slot && typeof saved.character_slot === 'object' && !Array.isArray(saved.character_slot)
+      ? saved.character_slot : null;
+    // The database row is the durable source of truth. In particular, an
+    // intentionally empty slot list is still saved state and must not fall
+    // back to template cosmetics on every login.
+    player.characterSlot = savedSlots ?? playerData.characterSlot ?? player.characterSlot;
+    player.role = saved.role ?? playerData.role ?? player.role;
+    player.stickerSlot = saved.sticker_slot ?? playerData.stickerSlot ?? player.stickerSlot;
+    player.inventory = toLegacyInventory(saved.inventory ?? playerData.inventory, player.inventory);
     // Currency defaults are seeded and persisted once by PlayerDataService.
     // Do not turn a legitimate saved zero into 6,000 in the response.
-    player.coin = Number(playerData.coin ?? saved.coin ?? 0);
-    player.amethyst = Number(playerData.amethyst ?? saved.amethyst ?? 0);
-    player.amulet = Number(playerData.amulet ?? saved.amulet ?? 0);
-    player.banStatus = playerData.banStatus || saved.ban_status || player.banStatus;
-    player.playerRecord = playerData.playerRecord || saved.player_record || player.playerRecord;
+    player.coin = Number(saved.coin ?? playerData.coin ?? 0);
+    player.amethyst = Number(saved.amethyst ?? playerData.amethyst ?? 0);
+    player.amulet = Number(saved.amulet ?? playerData.amulet ?? 0);
+    player.banStatus = saved.ban_status ?? playerData.banStatus ?? player.banStatus;
+    player.playerRecord = saved.player_record ?? playerData.playerRecord ?? player.playerRecord;
     player.isOnline = true;
     player.lastOnline = now;
     response.data.session_token = sessionToken;
@@ -1117,8 +1117,9 @@ app.post('/live/player/gameplay/endgameresult', async (req, res) => {
   try {
     await respondWithAuthedGamePlayer(req, res, async player => {
       const snapshot = safeGameSnapshot(req.body);
-      if (Buffer.byteLength(JSON.stringify(snapshot), 'utf8') > 128 * 1024) return gameError(res, 413, 'Game result payload is too large');
+      if (Buffer.byteLength(JSON.stringify(snapshot), 'utf8') > 512 * 1024) return gameError(res, 413, 'Game result payload is too large');
       const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+      const receivedFields = listSafeGameFieldNames(body);
       // Some client builds include the final loadout/inventory snapshot in
       // endgameresult rather than calling a dedicated save route. Persist the
       // recognized customization fields here as well; the helper merges slots
@@ -1127,10 +1128,15 @@ app.post('/live/player/gameplay/endgameresult', async (req, res) => {
       player.lastGameResult = snapshot;
       player.lastGameResultAt = new Date().toISOString();
       await player.save();
-      recordAdminLog('info', 'Player Save', `Authenticated end game result saved; customization=${Object.keys(savedCustomization).join(',') || 'none'}`, 200);
+      recordAdminLog('info', 'Player Save', `End-game snapshot persisted; received=${receivedFields.join(',') || '(none)'}; saved=${Object.keys(savedCustomization).join(',') || 'no recognized customization fields'}`, 200);
       res.json({ success: true, status: 1, code: 0, data: { profile: playerSaveDocument(await whitelistRepository.findBySteamId(player.steamId)), message: 'result saved' }, error: null });
     });
-  } catch (error) { console.error('[End Game Result]', error.message); gameError(res, 503, 'Game result could not be saved'); }
+  } catch (error) {
+    console.error('[End Game Result]', error.message);
+    const invalid = /must be|invalid|too large|character ID|contains invalid/i.test(error.message);
+    recordAdminLog(invalid ? 'warn' : 'error', 'Player Save', `End-game save failed: ${String(error.message || 'unknown error').slice(0, 180)}`, invalid ? 400 : 503);
+    if (!res.headersSent) gameError(res, invalid ? 400 : 503, invalid ? error.message : 'Game result could not be saved');
+  }
 });
 app.get('/live/bonus/api/get_bonus_data', async (_req, res) => {
   try {
