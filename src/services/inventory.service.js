@@ -147,6 +147,8 @@ class InventoryService {
 
     player.profile.display = profileId;
     player.profile.updatedAt = new Date();
+    player.save_source = 'game';
+    player._saveDataWrite = true;
     await player.save();
 
     return {
@@ -198,6 +200,8 @@ class InventoryService {
 
     player.stickerSlot.stickerpreset = stickerInfo.stickerpreset;
     player.stickerSlot.stickerSet = stickerInfo.stickerSet;
+    player.save_source = 'game';
+    player._saveDataWrite = true;
     await player.save();
 
     return {
@@ -333,6 +337,8 @@ class InventoryService {
 
     if (hasChanges) {
       player.markModified('characterSlot');
+      player.save_source = 'game';
+      player._saveDataWrite = true;
       await player.save();
     }
 
