@@ -400,24 +400,21 @@ class PlayerDataService {
   }
 
   buildCharacterSlotResponse(player) {
-    const ownedCharacters = player.inventory?.characters || [];
-    const hunterSlots = (player.characterSlot?.hunterSlot || []).filter(
-      (slot) => slot.character === 'None' || ownedCharacters.includes(slot.character)
-    );
-    const survivorSlots = (player.characterSlot?.survivorSlot || []).filter(
-      (slot) => slot.character === 'None' || ownedCharacters.includes(slot.character)
-    );
+    const saved = player.characterSlot && typeof player.characterSlot === 'object'
+      ? structuredClone(player.characterSlot) : {};
+    const hunterSlots = Array.isArray(saved.hunterSlot) ? saved.hunterSlot : [];
+    const survivorSlots = Array.isArray(saved.survivorSlot) ? saved.survivorSlot : [];
 
+    // Equipped cosmetics are player save state. Filtering them through the
+    // inventory list here silently replaced legitimate saved outfits with the
+    // default character on every login. Keep the submitted slots intact.
     return {
+      ...saved,
       hunterSlot: hunterSlots,
       survivorSlot: survivorSlots,
-      characterhunteritem: ownedCharacters.includes(player.characterSlot?.characterhunteritem)
-        ? player.characterSlot.characterhunteritem
-        : hunterSlots[0]?.character || 'Hunter_Belle',
-      characteritem: ownedCharacters.includes(player.characterSlot?.characteritem)
-        ? player.characterSlot.characteritem
-        : survivorSlots[0]?.character || 'Survivor_Tim',
-      updatedAt: (player.characterSlot?.updatedAt || new Date()).toISOString(),
+      characterhunteritem: saved.characterhunteritem || hunterSlots[0]?.character || 'Hunter_Belle',
+      characteritem: saved.characteritem || survivorSlots[0]?.character || 'Survivor_Tim',
+      updatedAt: saved.updatedAt || new Date().toISOString(),
     };
   }
 
@@ -442,6 +439,13 @@ class PlayerDataService {
     };
     response.data.player.inventory = this.convertInventoryToLegacyFormat(player.inventory);
     response.data.player.stickerSlot = player.stickerSlot || response.data.player.stickerSlot;
+    // Include persisted client appearance/save fields in the auth snapshot so
+    // the game can restore them immediately instead of loading template state.
+    for (const key of ['PlayerSaveGame','loadout','equippedSkins','selectedCharacter','DefaultCharacter','CharacterItem','CharacterHunterItem','StickerPreset','SurvivorSlots','HunterSlots','StickerAssets','FrameImage','PlayerCharacterInfo','CurseSlots','RelicSlots']) {
+      if (player[key] !== undefined && player[key] !== null) {
+        response.data.player[key] = structuredClone(player[key]);
+      }
+    }
     response.data.player.coin = player.coin ?? DEFAULT_PLAYER_CURRENCIES.coin;
     response.data.player.amethyst = player.amethyst ?? DEFAULT_PLAYER_CURRENCIES.amethyst;
     response.data.player.amulet = player.amulet ?? DEFAULT_PLAYER_CURRENCIES.amulet;
