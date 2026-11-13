@@ -1,11 +1,12 @@
 'use strict';
 
 let client = null;
-const DIRECT_FIELDS = new Set(['steamId','auth','session_token','profile','coin','amethyst','amulet','characterSlot','role','banStatus','playerRecord','stickerSlot','inventory','immortalData','isOnline','lastOnline','player_name','discord_id','status','notes']);
+const DIRECT_FIELDS = new Set(['steamId','auth','session_token','profile','coin','amethyst','amulet','characterSlot','role','banStatus','playerRecord','stickerSlot','inventory','immortalData','isOnline','lastOnline','player_name','discord_id','status','notes','save_data','save_updated_at','save_source','_saveDataWrite']);
 
 function fromRow(row) {
   const extra = row.game_data && typeof row.game_data === 'object' ? row.game_data : {};
-  const player = Object.assign(new Player(), extra, {
+  const saved = row.save_data && typeof row.save_data === 'object' && !Array.isArray(row.save_data) ? row.save_data : {};
+  const player = Object.assign(new Player(), extra, saved, {
     steamId: row.steam_id,
     auth: row.auth || extra.auth || [],
     session_token: row.session_token || null,
@@ -22,6 +23,11 @@ function fromRow(row) {
     immortalData: row.immortal_data ?? extra.immortalData ?? [],
     isOnline: Boolean(row.is_online),
     lastOnline: row.last_online || extra.lastOnline || null,
+    save_data: saved,
+    save_updated_at: row.save_updated_at || null,
+    // A non-empty snapshot can be a template/admin seed. Only trust the
+    // explicit source column; legacy rows without metadata are unknown.
+    save_source: row.save_source || 'unknown',
     _id: row.steam_id,
     id: row.id,
     status: row.status,
@@ -111,15 +117,48 @@ class Player {
       is_online: Boolean(this.isOnline),
       last_online: this.lastOnline instanceof Date ? this.lastOnline.toISOString() : (this.lastOnline || null),
       game_data: toGameData(this),
+      // Include the current values on upsert so login/session writes preserve
+      // an earlier game save while leaving its timestamp and provenance alone.
+      save_data: this.save_data && typeof this.save_data === 'object' && !Array.isArray(this.save_data) ? this.save_data : {},
+      save_updated_at: this.save_updated_at || null,
+      save_source: ['game','admin','template','server','unknown'].includes(this.save_source) ? this.save_source : 'template',
       updated_at: new Date().toISOString()
     };
+    // Ordinary saves (login/session/online state) must never manufacture or
+    // overwrite a game Save Data snapshot. Game/admin save handlers opt in.
+    if (this._saveDataWrite === true) {
+      record.save_data = buildSaveSnapshot(this);
+      record.save_updated_at = new Date().toISOString();
+      record.save_source = ['game','admin'].includes(this.save_source) ? this.save_source : 'game';
+    }
     if (this.player_name) record.player_name = this.player_name;
     if (this.discord_id) record.discord_id = this.discord_id;
     const { data, error } = await client.from('whitelists').upsert(record, { onConflict: 'steam_id' }).select('*').single();
     if (error) throw error;
+    this._saveDataWrite = false;
     Object.assign(this, fromRow(data));
     return this;
   }
+}
+
+function buildSaveSnapshot(player) {
+  const extras = toGameData(player);
+  const prior = player.save_data && typeof player.save_data === 'object' && !Array.isArray(player.save_data)
+    ? player.save_data : {};
+  return {
+    ...prior,
+    ...extras,
+    profile: player.profile || {},
+    coin: Number(player.coin) || 0,
+    amethyst: Number(player.amethyst) || 0,
+    amulet: Number(player.amulet) || 0,
+    characterSlot: player.characterSlot ?? null,
+    role: player.role || 'survivor',
+    playerRecord: player.playerRecord ?? null,
+    stickerSlot: player.stickerSlot ?? null,
+    inventory: player.inventory ?? null,
+    immortalData: player.immortalData || []
+  };
 }
 
 module.exports = Player;
