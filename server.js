@@ -372,7 +372,10 @@ app.get('/api/player-saves', async (_req, res, next) => {
   try {
     const { data, error } = await supabase.from('whitelists').select(PLAYER_SAVE_SELECT).order('updated_at', { ascending: false }).limit(5000);
     if (error) throw error;
-    res.set('Cache-Control', 'no-store').json(data.map(row => ({ ...row, save_data: playerSaveDocument(row) })));
+    // Keep the editor pointed at the actual JSONB snapshot. The composed
+    // player document includes defaults/columns and must not be presented as
+    // proof that the game has sent a save.
+    res.set('Cache-Control', 'no-store').json(data.map(row => ({ ...row, save_data: row.save_data && typeof row.save_data === 'object' ? row.save_data : {} })));
   } catch (e) { next(e); }
 });
 app.post('/api/player-saves', async (req, res, next) => {
@@ -385,6 +388,8 @@ app.post('/api/player-saves', async (req, res, next) => {
     const template = await playerDataService.loadPlayerTemplate();
     const saveData = req.body.save_data === undefined ? template : req.body.save_data;
     const split = splitPlayerSave(saveData);
+    split.save_source = 'template';
+    split.save_updated_at = null;
     const { data, error } = await supabase.from('whitelists').insert({
       steam_id: steamId, player_name: String(req.body.player_name || saveData.profile?.displayName || '').trim() || null,
       discord_id: null, status: 'pending', notes: null, auth: [], session_token: null,
@@ -392,16 +397,18 @@ app.post('/api/player-saves', async (req, res, next) => {
     }).select(PLAYER_SAVE_SELECT).single();
     if (error) throw error;
     recordAdminLog('info', 'Player Save', `Created save data for SteamID ${steamId}`, 201);
-    res.status(201).json({ ...data, save_data: playerSaveDocument(data) });
+    res.status(201).json({ ...data, save_data: data.save_data || {} });
   } catch (e) { next(e); }
 });
 app.put('/api/player-saves/:id', async (req, res, next) => {
   try {
     const split = splitPlayerSave(req.body.save_data);
+    split.save_source = 'admin';
+    split.save_updated_at = new Date().toISOString();
     const { data, error } = await supabase.from('whitelists').update({ ...split, updated_at: new Date().toISOString() }).eq('id', req.params.id).select(PLAYER_SAVE_SELECT).single();
     if (error) throw error;
     recordAdminLog('info', 'Player Save', `Saved game data for SteamID ${data.steam_id}`, 200);
-    res.set('Cache-Control', 'no-store').json({ ...data, save_data: playerSaveDocument(data) });
+    res.set('Cache-Control', 'no-store').json({ ...data, save_data: data.save_data || {} });
   } catch (e) { if (e.message === 'Save Data ต้องเป็น JSON object' || e.message === 'Save Data ใหญ่เกิน 900 KB') return res.status(400).json({ error: e.message }); next(e); }
 });
 app.get('/api/whitelists', async (req, res, next) => { try { res.json(await db.collection('whitelists').find({}, { orderBy: 'updated_at' })); } catch (e) { next(e); } });
@@ -958,10 +965,29 @@ function mergePlayerSaveGame(player, extracted) {
 async function persistGameCustomization(player, requestBody) {
   const payload = unwrapGameSavePayload(requestBody);
   const updates = {};
+  const safeSnapshot = sanitizeClientGameState(payload);
+  if (hasPlayerSaveState(safeSnapshot)) {
+    player.save_data = deepMergeSaveData(player.save_data || {}, safeSnapshot);
+    // Keep arbitrary save fields visible to existing game services while the
+    // save_data JSONB snapshot provides a durable full-document copy.
+    for (const [key, value] of Object.entries(safeSnapshot)) {
+      if (['profile','characterSlot','character_slot','stickerSlot','sticker_slot','playerRecord','player_record','immortalData','immortal_data'].includes(key)) continue;
+      if (key === 'PlayerSaveGame' && value && typeof value === 'object') {
+        player.PlayerSaveGame = deepMergeSaveData(player.PlayerSaveGame || {}, value);
+      } else if (!Object.hasOwn(player, key) || ['loadout','equippedSkins','selectedCharacter','PlayerSaveGame'].includes(key)) {
+        player[key] = value;
+      }
+    }
+    player.save_source = 'game';
+    player._saveDataWrite = true;
+    updates.save_data = Object.keys(safeSnapshot);
+  }
   const extractedSaveGame = extractPlayerSaveGameCustomization(payload);
   const saveGameCustomization = extractedSaveGame?.customization;
   if (saveGameCustomization) {
     mergePlayerSaveGame(player, extractedSaveGame);
+    player.save_source = 'game';
+    player._saveDataWrite = true;
     updates.PlayerSaveGame = Object.keys(saveGameCustomization);
   }
   const slotValue = pickGameSaveValue(payload, ['characterSlot','character_slot','slots']);
@@ -988,6 +1014,8 @@ async function persistGameCustomization(player, requestBody) {
       if (!normalized[collection]) normalized[collection] = [slots];
     }
     if (Object.keys(normalized).length) {
+      player.save_source = 'game';
+      player._saveDataWrite = true;
       await inventoryService.updateCharacterSlot(player, normalized, role);
       updates.characterSlot = player.characterSlot;
     }
@@ -1011,6 +1039,8 @@ async function persistGameCustomization(player, requestBody) {
       throw new Error(`${storedKey} must be JSON data under 200 KB`);
     }
     player[storedKey] = safeGameSnapshot(value);
+    player.save_source = 'game';
+    player._saveDataWrite = true;
     updates[storedKey] = player[storedKey];
   }
   const profile = pickGameSaveValue(payload, ['profile','Profile']);
@@ -1021,24 +1051,32 @@ async function persistGameCustomization(player, requestBody) {
       if (/coin|currency|money|cash|amulet|amethyst|balance|inventory|item|steam|discord|token|auth|ban|status/i.test(key)) delete safeProfile[key];
     }
     player.profile = { ...(player.profile || {}), ...safeProfile };
+    player.save_source = 'game';
+    player._saveDataWrite = true;
     updates.profile = player.profile;
   }
   const stickerSlot = pickGameSaveValue(payload, ['stickerSlot','sticker_slot','stickerInfo']);
   if (stickerSlot !== undefined) {
     if (!stickerSlot || typeof stickerSlot !== 'object' || Array.isArray(stickerSlot)) throw new Error('stickerSlot must be a JSON object');
     player.stickerSlot = safeGameSnapshot(stickerSlot);
+    player.save_source = 'game';
+    player._saveDataWrite = true;
     updates.stickerSlot = player.stickerSlot;
   }
   const playerRecord = pickGameSaveValue(payload, ['playerRecord','player_record']);
   if (playerRecord !== undefined) {
     if (!playerRecord || typeof playerRecord !== 'object' || Array.isArray(playerRecord)) throw new Error('playerRecord must be a JSON object');
     player.playerRecord = safeGameSnapshot(playerRecord);
+    player.save_source = 'game';
+    player._saveDataWrite = true;
     updates.playerRecord = player.playerRecord;
   }
   const immortalData = pickGameSaveValue(payload, ['immortalData','immortal_data']);
   if (immortalData !== undefined) {
     if (!Array.isArray(immortalData)) throw new Error('immortalData must be an array');
     player.immortalData = safeGameSnapshot(immortalData);
+    player.save_source = 'game';
+    player._saveDataWrite = true;
     updates.immortalData = player.immortalData;
   }
   // Client currency and ownership claims are deliberately ignored. Purchases,
@@ -1047,7 +1085,12 @@ async function persistGameCustomization(player, requestBody) {
     .filter(key => Object.hasOwn(payload, key));
   if (ignoredClientManaged.length) recordAdminLog('warn', 'Player Save', `Ignored client-managed fields: ${ignoredClientManaged.join(',')}`);
 
-  if (Object.keys(updates).length) await player.save();
+  if (Object.keys(updates).length) {
+    player.save_source = 'game';
+    player._saveDataWrite = true;
+    await player.save();
+  }
+  player._saveDataWrite = false;
   return updates;
 }
 async function handleGameSaveRequest(req, res) {
@@ -1059,7 +1102,8 @@ async function handleGameSaveRequest(req, res) {
       const row = await whitelistRepository.findBySteamId(player.steamId);
       const profile = playerSaveDocument(row || {});
       profile.steamid = player.steamId;
-      recordAdminLog('info', 'Player Save', `Saved authenticated player customization; fields=${Object.keys(updated).join(',') || 'no mutable state'}`, 200);
+      const saveMeta = row?.save_updated_at ? `; source=${row.save_source || 'unknown'}; savedAt=${row.save_updated_at}` : '; no persisted game Save Data received yet';
+      recordAdminLog(Object.keys(updated).length ? 'info' : 'warn', 'Player Save', `Received ${req.method} ${req.path}; fields=${listSafeGameFieldNames(body).join(',') || '(none)'}; persisted=${Object.keys(updated).join(',') || 'none'}${saveMeta}`, Object.keys(updated).length ? 200 : 200);
       res.set('Cache-Control', 'no-store').status(200).json({ success: true, status: 'success', code: 0, data: { profile } });
     });
   } catch (error) {
@@ -1113,7 +1157,24 @@ app.post('/api/savePlayerData', async (req, res) => {
       if (Object.hasOwn(updates, 'sticker_slot')) player.stickerSlot = updates.sticker_slot;
       if (Object.hasOwn(updates, 'player_record')) player.playerRecord = updates.player_record;
       if (Object.hasOwn(updates, 'immortal_data')) player.immortalData = updates.immortal_data;
-      if (Object.keys(updates).length) await player.save();
+      const safeSnapshot = sanitizeClientGameState(payload);
+      if (hasPlayerSaveState(safeSnapshot)) {
+        player.save_data = deepMergeSaveData(player.save_data || {}, safeSnapshot);
+        for (const [key, value] of Object.entries(safeSnapshot)) {
+          if (['profile','characterSlot','character_slot','stickerSlot','sticker_slot','playerRecord','player_record','immortalData','immortal_data'].includes(key)) continue;
+          if (key === 'PlayerSaveGame' && value && typeof value === 'object') player.PlayerSaveGame = deepMergeSaveData(player.PlayerSaveGame || {}, value);
+          else player[key] = value;
+        }
+        player.save_source = 'game';
+        player._saveDataWrite = true;
+      }
+      const saveFields = Object.keys(updates).length > 0 || hasPlayerSaveState(safeSnapshot);
+      if (saveFields) {
+        player.save_source = 'game';
+        player._saveDataWrite = true;
+        await player.save();
+        player._saveDataWrite = false;
+      }
 
       // Store additional non-reserved game fields in JSONB, without allowing
       // callers to smuggle identity, credentials, economy, or moderation fields.
@@ -1128,13 +1189,17 @@ app.post('/api/savePlayerData', async (req, res) => {
           }
           player[key] = value;
         }
+        // Extras here came from the authenticated game save request too.
+        player.save_source = 'game';
+        player._saveDataWrite = true;
         await player.save();
+        player._saveDataWrite = false;
       }
 
       const savedRow = await whitelistRepository.findBySteamId(player.steamId);
       const data = playerSaveDocument(savedRow);
       data.steamid = player.steamId;
-      recordAdminLog('info', 'Player Save', 'Authenticated player data saved', 200);
+      recordAdminLog(saveFields ? 'info' : 'warn', 'Player Save', `Received ${req.method} ${req.path}; fields=${listSafeGameFieldNames(req.body).join(',') || '(none)'}; persisted=${saveFields ? Object.keys(updates).join(',') || 'game snapshot' : 'none'}`, 200);
       res.set('Cache-Control', 'no-store').json({ success: true, data });
     });
   } catch (error) {
@@ -1154,6 +1219,39 @@ function safeGameSnapshot(value, depth = 0) {
     result[key] = safeGameSnapshot(item, depth + 1);
   }
   return result;
+}
+const CLIENT_SAVE_BLOCKED_KEYS = new Set([
+  'auth','steamid','steam_id','csteamid','playerid','playersessionid','sessiontoken','session_token','accesstoken','access_token','ticket','authorization','secret','apikey','api_key',
+  'coin','coins','currency','currencies','cash','gold','gem','gems','amethyst','amulet','balance','wallet','inventory','playerinventoryinfo','items','itemlist','unlockedcharacters','unlockedskins','ownership','owneditems','ownedcharacters','ownedskins',
+  'banstatus','ban_status','whiteliststatus','status','role','isonline','is_online','lastonline','last_online'
+]);
+function sanitizeClientGameState(value, depth = 0) {
+  if (depth > 8 || value === null || ['string','number','boolean'].includes(typeof value)) return value;
+  if (Array.isArray(value)) return value.slice(0, 500).map(item => sanitizeClientGameState(item, depth + 1));
+  if (!value || typeof value !== 'object') return null;
+  const result = {};
+  for (const [key, item] of Object.entries(value).slice(0, 300)) {
+    const normalized = key.replace(/[^a-z0-9]/gi, '').toLowerCase();
+    if (CLIENT_SAVE_BLOCKED_KEYS.has(key.toLowerCase()) || CLIENT_SAVE_BLOCKED_KEYS.has(normalized)) continue;
+    if (/^(?:.*)(?:sessiontoken|accesstoken|steamid|discordid|apikey|authorization|ticket|secret)$/i.test(normalized)) continue;
+    result[key] = sanitizeClientGameState(item, depth + 1);
+  }
+  return result;
+}
+function deepMergeSaveData(base, patch) {
+  if (!base || typeof base !== 'object' || Array.isArray(base) || !patch || typeof patch !== 'object' || Array.isArray(patch)) return patch;
+  const merged = { ...base };
+  for (const [key, value] of Object.entries(patch)) {
+    merged[key] = value && typeof value === 'object' && !Array.isArray(value) && merged[key] && typeof merged[key] === 'object' && !Array.isArray(merged[key])
+      ? deepMergeSaveData(merged[key], value) : value;
+  }
+  return merged;
+}
+function hasPlayerSaveState(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const relevant = /^(?:playersavegame|s_player_info|playerinfo|loadout|equippedskins|selectedcharacter|characterslot|character_slot|profile|stickerslot|sticker_slot|playerrecord|player_record|immortaldata|immortal_data|hunterSlot|survivorSlot|characteritem|characterhunteritem)$/i;
+  return Object.entries(value).some(([key, item]) => relevant.test(key) && item !== undefined && item !== null &&
+    (typeof item !== 'object' || Array.isArray(item) || Object.keys(item).length > 0));
 }
 app.post('/live/mailbox/get', async (req, res) => {
   try {
@@ -1183,10 +1281,30 @@ app.post('/live/player/gameplay/endgameresult', async (req, res) => {
       // recognized customization fields here as well; the helper merges slots
       // and ignores client-supplied currency/item ownership claims.
       const savedCustomization = await persistGameCustomization(player, body);
+      // Keep an inspectable, bounded copy of the end-match payload in the
+      // Save Data JSONB too. A number of client builds send results without
+      // their outfit fields; storing this safe diagnostic snapshot lets the
+      // admin see what arrived instead of showing an empty Save Data page.
+      // This is explicitly an incoming payload, not proof the client applied
+      // or persisted the submitted loadout.
+      const safeResult = sanitizeClientGameState(body);
+      const serializedResult = JSON.stringify(safeResult);
+      player.save_data = deepMergeSaveData(player.save_data || {}, {
+        last_game_result: {
+          endpoint: req.path,
+          received_at: new Date().toISOString(),
+          fields: receivedFields,
+          customization_persisted: Object.keys(savedCustomization).length > 0,
+          payload: Buffer.byteLength(serializedResult, 'utf8') <= 180 * 1024 ? safeResult : null,
+          payload_omitted: Buffer.byteLength(serializedResult, 'utf8') > 180 * 1024,
+        },
+      });
+      player.save_source = 'game';
+      player._saveDataWrite = true;
       player.lastGameResult = snapshot;
       player.lastGameResultAt = new Date().toISOString();
       await player.save();
-      recordAdminLog('info', 'Player Save', `End-game snapshot persisted; received=${receivedFields.join(',') || '(none)'}; saved=${Object.keys(savedCustomization).join(',') || 'no recognized customization fields'}`, 200);
+      recordAdminLog('info', 'Player Save', `End-game payload saved for inspection; received=${receivedFields.join(',') || '(none)'}; customization=${Object.keys(savedCustomization).join(',') || 'not present/recognized'}`, 200);
       res.json({ success: true, status: 1, code: 0, data: { profile: playerSaveDocument(await whitelistRepository.findBySteamId(player.steamId)), message: 'result saved' }, error: null });
     });
   } catch (error) {
@@ -1250,11 +1368,54 @@ app.post('/logapi/v1/add/matchlog', (req, res) => {
 // Keep unknown game routes machine-readable and visible in Admin → System Logs.
 app.use(['/live', '/logapi'], (req, res) => {
   const path = sanitizeGamePath(req.originalUrl.split('?')[0]);
+  // Unknown write routes are a common reason game Save Data stays empty: the
+  // fallback used to log a 404 and discard the only copy of the game's payload.
+  // Keep a bounded, sanitized diagnostic snapshot for authenticated player
+  // mutations so the admin can inspect the actual Unreal field names. This does
+  // NOT claim to apply the unknown operation; it still returns 404 below.
+  const isUnknownPlayerWrite = /^\/live\/player\//i.test(path) &&
+    ['POST', 'PUT', 'PATCH'].includes(req.method) &&
+    /(?:save|edit|update|set|change|custom|slot|profile|sticker|character|loadout|result)/i.test(path);
+  if (isUnknownPlayerWrite) {
+    Promise.resolve().then(async () => {
+      const rawBody = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+      const safeBody = sanitizeClientGameState(rawBody);
+      const serialized = JSON.stringify(safeBody || {});
+      if (!safeBody || !Object.keys(safeBody).length || Buffer.byteLength(serialized, 'utf8') > 500 * 1024) return;
+      await respondWithAuthedGamePlayer(req, res, async player => {
+        const prior = player.save_data && typeof player.save_data === 'object' && !Array.isArray(player.save_data)
+          ? player.save_data : {};
+        player.save_data = {
+          ...prior,
+          last_unmapped_game_write: {
+            endpoint: path,
+            method: req.method,
+            received_at: new Date().toISOString(),
+            fields: Object.keys(safeBody).slice(0, 100),
+            data: safeBody,
+            applied: false,
+          },
+        };
+        player.save_source = 'game';
+        player._saveDataWrite = true;
+        await player.save();
+        recordAdminLog('warn', 'Player Save', `Captured authenticated payload for unmapped write ${req.method} ${path}; saved for inspection, operation not applied`, 404);
+      });
+    }).catch(error => {
+      console.error('[Player Save] unmapped write capture failed:', error.message);
+      recordAdminLog('warn', 'Player Save', `Could not capture unmapped write ${req.method} ${path}: ${String(error.message).slice(0, 160)}`, 500);
+    }).finally(() => {
+      if (res.headersSent) return;
+      recordAdminLog('warn', 'Game API', `No handler registered for ${req.method} ${path}`, 404, identifyGameClient(req));
+      gameError(res, 404, `Game API endpoint is not implemented: ${req.method} ${path}`);
+    });
+    return;
+  }
   recordAdminLog('warn', 'Game API', `No handler registered for ${req.method} ${path}`, 404, identifyGameClient(req));
   gameError(res, 404, `Game API endpoint is not implemented: ${req.method} ${path}`);
 });
 app.use((err, req, res, next) => { console.error(err); res.status(400).json({ error: err.message || 'Request failed' }); });
-const PLAYER_SAVE_SELECT = 'id,steam_id,discord_id,player_name,status,profile,coin,amethyst,amulet,character_slot,role,ban_status,player_record,sticker_slot,inventory,immortal_data,game_data,is_online,last_online,created_at,updated_at';
+const PLAYER_SAVE_SELECT = 'id,steam_id,discord_id,player_name,status,profile,coin,amethyst,amulet,character_slot,role,ban_status,player_record,sticker_slot,inventory,immortal_data,game_data,save_data,save_updated_at,save_source,is_online,last_online,created_at,updated_at';
 const PLAYER_SAVE_FIELDS = [
   ['profile','profile'],['coin','coin'],['amethyst','amethyst'],['amulet','amulet'],
   ['characterSlot','character_slot','character_slot'],['role','role'],['banStatus','ban_status','ban_status'],
@@ -1263,7 +1424,9 @@ const PLAYER_SAVE_FIELDS = [
 ];
 const PLAYER_SAVE_PRIVATE_KEYS = new Set(['steamId','steam_id','_id','id','auth','session_token','sessionToken','player_name','discord_id','status','notes','createdAt','updatedAt','_exists']);
 function playerSaveDocument(row) {
-  const document = row.game_data && typeof row.game_data === 'object' && !Array.isArray(row.game_data) ? { ...row.game_data } : {};
+  const legacy = row.game_data && typeof row.game_data === 'object' && !Array.isArray(row.game_data) ? row.game_data : {};
+  const dedicated = row.save_data && typeof row.save_data === 'object' && !Array.isArray(row.save_data) ? row.save_data : {};
+  const document = { ...legacy, ...dedicated };
   for (const key of PLAYER_SAVE_PRIVATE_KEYS) delete document[key];
   for (const [key, column, alias] of PLAYER_SAVE_FIELDS) {
     if (row[column] !== undefined) document[key] = row[column];
@@ -1293,7 +1456,9 @@ function splitPlayerSave(value) {
     const mapping = PLAYER_SAVE_FIELDS.find(([name, , alias]) => key === name || (alias && key === alias));
     if (!mapping) gameData[key] = entry;
   }
-  const result = { game_data: gameData };
+  const saveData = {};
+  for (const [key, entry] of Object.entries(value)) if (!PLAYER_SAVE_PRIVATE_KEYS.has(key)) saveData[key] = entry;
+  const result = { game_data: gameData, save_data: saveData };
   for (const [key, column, alias] of PLAYER_SAVE_FIELDS) {
     const inputKey = Object.hasOwn(value, key) ? key : alias && Object.hasOwn(value, alias) ? alias : null;
     if (!inputKey) continue;
@@ -1306,7 +1471,7 @@ function splitPlayerSave(value) {
   }
   return result;
 }
-function cleanWhitelist(x = {}) { return { steam_id: String(x.steam_id || '').trim(), discord_id: String(x.discord_id || '').trim() || null, player_name: String(x.player_name || '').trim() || null, status: ['approved','pending','banned'].includes(x.status) ? x.status : 'pending', notes: String(x.notes || '').trim() || null, auth: x.auth || [], session_token: x.session_token || null, profile: x.profile || {}, coin: Number(x.coin) || 0, amethyst: Number(x.amethyst) || 0, amulet: Number(x.amulet) || 0, character_slot: x.character_slot ?? null, role: x.role || 'survivor', ban_status: x.ban_status ?? null, player_record: x.player_record ?? null, sticker_slot: x.sticker_slot ?? null, inventory: x.inventory ?? null, immortal_data: x.immortal_data || [], game_data: x.game_data && typeof x.game_data === 'object' ? x.game_data : {}, is_online: Boolean(x.is_online), last_online: x.last_online || null }; }
+function cleanWhitelist(x = {}) { return { steam_id: String(x.steam_id || '').trim(), discord_id: String(x.discord_id || '').trim() || null, player_name: String(x.player_name || '').trim() || null, status: ['approved','pending','banned'].includes(x.status) ? x.status : 'pending', notes: String(x.notes || '').trim() || null, auth: x.auth || [], session_token: x.session_token || null, profile: x.profile || {}, coin: Number(x.coin) || 0, amethyst: Number(x.amethyst) || 0, amulet: Number(x.amulet) || 0, character_slot: x.character_slot ?? null, role: x.role || 'survivor', ban_status: x.ban_status ?? null, player_record: x.player_record ?? null, sticker_slot: x.sticker_slot ?? null, inventory: x.inventory ?? null, immortal_data: x.immortal_data || [], game_data: x.game_data && typeof x.game_data === 'object' ? x.game_data : {}, save_data: x.save_data && typeof x.save_data === 'object' ? x.save_data : {}, save_updated_at: x.save_updated_at || null, save_source: ['template','game','admin','server','unknown'].includes(x.save_source) ? x.save_source : 'template', is_online: Boolean(x.is_online), last_online: x.last_online || null }; }
 function compareLauncherVersions(a, b) { const parts = value => String(value).match(/^\d+\.\d+\.\d+/)[0].split('.').map(Number); const left = parts(a), right = parts(b); for (let i = 0; i < 3; i++) if (left[i] !== right[i]) return left[i] - right[i]; return 0; }
 function cleanServer(x = {}) { return { room_name: String(x.room_name || '').trim(), host_ip: String(x.host_ip || '').trim(), port: Number(x.port) || 0, max_players: Number(x.max_players) || 0, is_online: Boolean(x.is_online), server_version: String(x.server_version || '').trim() || null, extra: x.extra && typeof x.extra === 'object' ? x.extra : {} }; }
 function cleanRoomText(value, maxLength) { if (typeof value !== 'string') return ''; return value.trim().replace(/[\u0000-\u001f\u007f]/g, '').slice(0, maxLength); }
