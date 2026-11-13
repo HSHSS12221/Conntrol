@@ -276,6 +276,9 @@ class InventoryService {
   }
 
   mergeCharacterLoadouts(previous = [], incoming = []) {
+    // An explicitly submitted empty array means the game cleared this list.
+    // Do not silently resurrect the old outfits in that case.
+    if (Array.isArray(incoming) && incoming.length === 0) return [];
     if (!Array.isArray(previous) || !previous.length) return structuredClone(incoming);
     if (!Array.isArray(incoming) || !incoming.length) return structuredClone(previous);
     const identity = (slot, index) => String(
