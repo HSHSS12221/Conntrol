@@ -839,17 +839,51 @@ async function respondWithAuthedGamePlayer(req, res, action) {
   await action(player);
 }
 function unwrapGameSavePayload(body) {
-  let payload = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
-  for (let depth = 0; depth < 4; depth++) {
-    const nested = payload.playerData ?? payload.player_data ?? payload.payload ?? payload.data ?? payload.player;
-    if (!nested || typeof nested !== 'object' || Array.isArray(nested)) break;
-    payload = nested;
+  let payload = body;
+  if (Array.isArray(payload)) {
+    // Some Unreal export/bridge callers serialize a single SaveGame object in
+    // an array. Select only the entry that actually contains player fields.
+    payload = payload.find(item => item && typeof item === 'object' &&
+      (item.S_PlayerInfo || item.s_player_info || item.Properties || item.properties ||
+       Object.keys(item).some(key => [...PLAYER_SAVEGAME_CUSTOMIZATION_FIELDS].some(field => matchesGameSaveField(key, field))))) || {};
   }
-  return payload;
+  if (!payload || typeof payload !== 'object') return {};
+  const wrappers = new Set(['playerdata','payload','data','player','savegame','playersavegame','request','body']);
+  const seen = new Set();
+  for (let depth = 0; depth < 8 && payload && typeof payload === 'object' && !Array.isArray(payload) && !seen.has(payload); depth++) {
+    seen.add(payload);
+    const entries = Object.entries(payload);
+    const hasPlayerFields = entries.some(([key]) =>
+      [...PLAYER_SAVEGAME_CUSTOMIZATION_FIELDS].some(field => matchesGameSaveField(key, field)) ||
+      ['splayerinfo','characterSlot','character_slot','loadout','equippedSkins','selectedCharacter'].includes(normalizeGameFieldName(key)));
+    if (hasPlayerFields) break;
+    const nested = entries.find(([key, value]) => wrappers.has(normalizeGameFieldName(key)) && value && typeof value === 'object');
+    if (!nested) break;
+    payload = Array.isArray(nested[1]) ? nested[1][0] : nested[1];
+  }
+  return payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
 }
 function pickGameSaveValue(payload, names) {
-  for (const name of names) if (Object.hasOwn(payload, name)) return payload[name];
-  for (const [key, value] of Object.entries(payload)) if (names.some(name => matchesGameSaveField(key, name))) return value;
+  if (!payload || typeof payload !== 'object') return undefined;
+  const matches = key => names.some(name => matchesGameSaveField(key, name));
+  for (const [key, value] of Object.entries(payload)) if (matches(key)) return value;
+  // Unreal commonly wraps values in Properties/S_PlayerInfo and the API
+  // bridge may add another data/player envelope. Search boundedly, while
+  // skipping credential branches and avoiding cycles/unbounded client JSON.
+  const queue = [[payload, 0]];
+  const seen = new Set();
+  let visited = 0;
+  while (queue.length && visited++ < 2000) {
+    const [node, depth] = queue.shift();
+    if (!node || typeof node !== 'object' || depth > 12 || seen.has(node)) continue;
+    seen.add(node);
+    const entries = Array.isArray(node) ? node.map((value, index) => [String(index), value]) : Object.entries(node);
+    for (const [key, value] of entries) if (matches(key)) return value;
+    for (const [key, value] of entries) {
+      if (/ticket|session|token|secret|authorization|credential/i.test(key)) continue;
+      if (value && typeof value === 'object') queue.push([value, depth + 1]);
+    }
+  }
   return undefined;
 }
 // Unreal export JSON names user-defined struct fields like
@@ -869,8 +903,20 @@ const PLAYER_SAVEGAME_CUSTOMIZATION_FIELDS = new Set([
   'DefaultCharacter','CharacterItem','CharacterHunterItem','StickerPreset',
   'SurvivorSlots','HunterSlots','StickerAssets','FrameImage',
   'PlayerCharacterInfo','CurseSlots','RelicSlots',
-  'PlayerRecordHunter','PlayerRecordSurvivor','PlayerRecord4v4',
 ]);
+const PLAYER_SAVEGAME_UNREAL_FIELDS = {
+  DefaultCharacter: 'DefaultCharacter_58_A0FB71274BD1A1149454D5BA5844F62D',
+  CharacterItem: 'CharacterItem_92_4D600D7B4AA8AEF823F8EABF937B8163',
+  CharacterHunterItem: 'CharacterHunterItem_79_E7DF4A37453201890FFBE1A8CAAA4870',
+  StickerPreset: 'StickerPreset_128_50948BB14FFC563D32896EB7F8AF9FCB',
+  SurvivorSlots: 'SurvivorSlots_90_07CE3003426039B5002958BE668DA7BE',
+  HunterSlots: 'HunterSlots_91_2927702B499D1DEBE923E0935011AA35',
+  StickerAssets: 'StickerAssets_121_E781DF3A46715283D73953966AA1F1BC',
+  FrameImage: 'FrameImage_177_1F266F0844EC07BEDF59F3964E1B1D60',
+  PlayerCharacterInfo: 'PlayerCharacterInfo_156_38BD7A554EBF3133B1A95C999F006268',
+  CurseSlots: 'CurseSlots_171_1DFCBCD14A35F106D181D1B23488C2A8',
+  RelicSlots: 'RelicSlots_172_067885774C69D8BBF4A4DF9092F726F0',
+};
 function extractPlayerSaveGameCustomization(payload) {
   const source = pickGameSaveValue(payload, ['S_PlayerInfo','s_player_info','PlayerSaveGame','playerSaveGame','playerInfo','PlayerInfo'])
     ?? (payload.Properties || payload.properties || Object.keys(payload).some(key => [...PLAYER_SAVEGAME_CUSTOMIZATION_FIELDS].some(field => matchesGameSaveField(key, field))) ? payload : null);
@@ -881,27 +927,42 @@ function extractPlayerSaveGameCustomization(payload) {
   const info = properties.S_PlayerInfo ?? properties.s_player_info ?? properties;
   if (!info || typeof info !== 'object' || Array.isArray(info)) return null;
   const customization = {};
+  const unrealFields = {};
   for (const [key, value] of Object.entries(info)) {
     const canonicalField = [...PLAYER_SAVEGAME_CUSTOMIZATION_FIELDS].find(field => matchesGameSaveField(key, field));
     if (!canonicalField) continue;
     if (Buffer.byteLength(JSON.stringify(value), 'utf8') > 200 * 1024) throw new Error(`${key} is too large`);
     customization[canonicalField] = safeGameSnapshot(value);
+    // Keep the exact Blueprint property name as well as a clean alias. The
+    // game/export uses GUID-suffixed names; dropping them on the response can
+    // make a saved outfit appear to revert when the client reloads its struct.
+    unrealFields[key] = safeGameSnapshot(value);
   }
-  return Object.keys(customization).length ? customization : null;
+  return Object.keys(customization).length ? { customization, unrealFields } : null;
+}
+function mergePlayerSaveGame(player, extracted) {
+  if (!extracted?.customization) return false;
+  const previous = player.PlayerSaveGame && typeof player.PlayerSaveGame === 'object' && !Array.isArray(player.PlayerSaveGame)
+    ? player.PlayerSaveGame : {};
+  const previousInfo = previous.S_PlayerInfo && typeof previous.S_PlayerInfo === 'object' && !Array.isArray(previous.S_PlayerInfo)
+    ? previous.S_PlayerInfo : {};
+  player.PlayerSaveGame = {
+    ...previous,
+    ...extracted.customization,
+    S_PlayerInfo: { ...previousInfo, ...extracted.unrealFields },
+  };
+  // Preserve the clean aliases for our admin tools and older clients too.
+  for (const [key, value] of Object.entries(extracted.customization)) player[key] = value;
+  return true;
 }
 async function persistGameCustomization(player, requestBody) {
   const payload = unwrapGameSavePayload(requestBody);
   const updates = {};
-  const saveGameCustomization = extractPlayerSaveGameCustomization(payload);
+  const extractedSaveGame = extractPlayerSaveGameCustomization(payload);
+  const saveGameCustomization = extractedSaveGame?.customization;
   if (saveGameCustomization) {
-    const previous = player.PlayerSaveGame && typeof player.PlayerSaveGame === 'object' && !Array.isArray(player.PlayerSaveGame)
-      ? player.PlayerSaveGame : {};
-    player.PlayerSaveGame = { ...previous, ...saveGameCustomization };
+    mergePlayerSaveGame(player, extractedSaveGame);
     updates.PlayerSaveGame = Object.keys(saveGameCustomization);
-    // Mirror received Unreal fields as top-level game data too. Auth response
-    // construction restores game_data onto the player object, so clients that
-    // request these legacy keys continue to receive them on the next login.
-    for (const [key, value] of Object.entries(saveGameCustomization)) player[key] = value;
   }
   const slotValue = pickGameSaveValue(payload, ['characterSlot','character_slot','slots']);
   const loadout = pickGameSaveValue(payload, ['loadout','Loadout']);
@@ -1062,10 +1123,7 @@ app.post('/api/savePlayerData', async (req, res) => {
         for (const [key, value] of Object.entries(extras)) {
           if (/^(playersavegame|s_player_info|playerinfo)$/i.test(key)) {
             const customization = extractPlayerSaveGameCustomization({ [key]: value });
-            if (customization) {
-              player.PlayerSaveGame = { ...(player.PlayerSaveGame || {}), ...customization };
-              Object.assign(player, customization);
-            }
+            if (customization) mergePlayerSaveGame(player, customization);
             continue;
           }
           player[key] = value;
@@ -1209,6 +1267,20 @@ function playerSaveDocument(row) {
   for (const key of PLAYER_SAVE_PRIVATE_KEYS) delete document[key];
   for (const [key, column, alias] of PLAYER_SAVE_FIELDS) {
     if (row[column] !== undefined) document[key] = row[column];
+  }
+  // The extracted Blueprint defines these members with GUID-suffixed keys
+  // inside S_PlayerInfo. Rebuild missing exact keys from persisted clean aliases
+  // so saves created by older server versions still deserialize in Unreal.
+  const saveGame = document.PlayerSaveGame && typeof document.PlayerSaveGame === 'object' && !Array.isArray(document.PlayerSaveGame)
+    ? document.PlayerSaveGame : null;
+  if (saveGame) {
+    const existingInfo = saveGame.S_PlayerInfo && typeof saveGame.S_PlayerInfo === 'object' && !Array.isArray(saveGame.S_PlayerInfo)
+      ? saveGame.S_PlayerInfo : {};
+    const info = { ...existingInfo };
+    for (const [field, unrealKey] of Object.entries(PLAYER_SAVEGAME_UNREAL_FIELDS)) {
+      if (info[unrealKey] === undefined && document[field] !== undefined) info[unrealKey] = document[field];
+    }
+    document.PlayerSaveGame = { ...saveGame, S_PlayerInfo: info };
   }
   return document;
 }
