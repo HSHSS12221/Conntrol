@@ -1338,7 +1338,7 @@ app.post('/logapi/v1/add/ingame', (req, res) => {
   recordAdminLog('info', 'Game Client', `Received in-game log event; fields=${fields.join(',') || '(none)'}`, 200);
   res.status(200).json({ status: 'success' });
 });
-app.post('/logapi/v1/add/matchlog', (req, res) => {
+app.post('/logapi/v1/add/matchlog', async (req, res) => {
   // Match logs can arrive as one object or as a batch. Keep only short,
   // non-sensitive scalar values in the diagnostic log; never store tickets,
   // session credentials, or the full request body here.
@@ -1350,6 +1350,7 @@ app.post('/logapi/v1/add/matchlog', (req, res) => {
     .slice(0, 120);
   const entries = Array.isArray(req.body) ? req.body.slice(0, 20) : [req.body];
   let recorded = 0;
+  let persisted = 0;
   for (const entry of entries) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
     const details = Object.entries(entry)
@@ -1361,9 +1362,52 @@ app.post('/logapi/v1/add/matchlog', (req, res) => {
       ? details.join('; ')
       : `Received match log event; fields=${fields.join(',') || '(none)'}`, 200);
     recorded++;
+
+    // The observed client sends match logs with SteamID and a Data object,
+    // but does not send a dedicated save request at match end. Keep a small,
+    // explicitly unverified telemetry snapshot on the matching existing
+    // player's save_data. Never apply currencies, inventory, ownership, or
+    // loadout fields from this unauthenticated logging endpoint.
+    const steamId = String(entry.SteamID ?? entry.steamId ?? entry.steam_id ?? '').trim();
+    if (!/^\d{17}$/.test(steamId) || !whitelistRepository) continue;
+    try {
+      const player = await PlayerModel.findOne({ steamId });
+      if (!player) continue;
+      const rawData = entry.Data && typeof entry.Data === 'object' && !Array.isArray(entry.Data) ? entry.Data : {};
+      const safeData = sanitizeClientGameState(rawData);
+      const snapshot = {
+        received_at: new Date().toISOString(),
+        endpoint: '/logapi/v1/add/matchlog',
+        identity_verified: false,
+        fields: Object.keys(rawData).slice(0, 100),
+        type: safeValue(entry.Type).slice(0, 80),
+        gsid: safeValue(entry.GSID).slice(0, 80),
+        name: safeValue(entry.Name).slice(0, 80),
+        state: safeValue(entry.State).slice(0, 80),
+        data: safeData,
+      };
+      if (Buffer.byteLength(JSON.stringify(snapshot), 'utf8') > 64 * 1024) {
+        snapshot.data = null;
+        snapshot.payload_omitted = true;
+      }
+      const priorSave = player.save_data && typeof player.save_data === 'object' && !Array.isArray(player.save_data)
+        ? player.save_data : {};
+      const previous = Array.isArray(priorSave.match_history) ? priorSave.match_history : [];
+      player.save_data = {
+        ...priorSave,
+        last_match_log: snapshot,
+        match_history: [...previous.slice(-19), snapshot],
+      };
+      player.save_source = 'game';
+      player._saveDataWrite = true;
+      await player.save();
+      persisted++;
+    } catch (error) {
+      recordAdminLog('warn', 'Player Save', `Match log received but Save Data write failed: ${String(error.message).slice(0, 180)}`, 500);
+    }
   }
   if (!recorded) recordAdminLog('info', 'Match Log', 'Received match log payload with no safe scalar fields', 200);
-  res.status(200).json({ status: 'success', recorded });
+  res.status(200).json({ status: 'success', recorded, persisted });
 });
 // Keep unknown game routes machine-readable and visible in Admin → System Logs.
 app.use(['/live', '/logapi'], (req, res) => {
