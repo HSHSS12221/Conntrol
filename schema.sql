@@ -25,6 +25,11 @@ alter table public.whitelists add column if not exists sticker_slot jsonb;
 alter table public.whitelists add column if not exists inventory jsonb;
 alter table public.whitelists add column if not exists immortal_data jsonb not null default '[]'::jsonb;
 alter table public.whitelists add column if not exists game_data jsonb not null default '{}'::jsonb;
+-- Canonical full game save snapshot. `game_data` remains for backward
+-- compatibility with older deployments; the API reads it as a fallback.
+alter table public.whitelists add column if not exists save_data jsonb not null default '{}'::jsonb;
+alter table public.whitelists add column if not exists save_updated_at timestamptz;
+alter table public.whitelists add column if not exists save_source text not null default 'template';
 alter table public.whitelists add column if not exists is_online boolean not null default false;
 alter table public.whitelists add column if not exists last_online timestamptz;
 create table if not exists public.serverinfo (
