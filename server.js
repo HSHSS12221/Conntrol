@@ -40,6 +40,10 @@ function recordAdminLog(level, source, message, status = null, game = null) {
   adminLogs.unshift({ at: new Date().toISOString(), level, source, message: String(message).slice(0, 1200), status, game });
   if (adminLogs.length > 300) adminLogs.length = 300;
 }
+// Controllers can add safe, operation-level events to the same System Logs
+// view as HTTP request/response summaries. Keep payload values and credentials
+// out of these entries; only field names and persistence outcome are recorded.
+app.locals.recordAdminLog = recordAdminLog;
 app.use((req, res, next) => {
   const requestPath = req.path;
   if (!/^\/(?:live|logapi)\//i.test(requestPath)) return next();
@@ -712,36 +716,144 @@ async function configuredGameServerTarget() {
   return { serverIp: host, serverPort: port, connectionAddress: `${host}:${port}` };
 }
 
-function normalizeGameLobbyResult(value, serverTarget) {
-  const result = value && typeof value === 'object' ? value : {};
-  const lobby = result.lobby && typeof result.lobby === 'object' ? result.lobby : null;
+// ---------------------------------------------------------------------------
+// Room + matchmaking store used by the game client (/live/lobby/* and
+// /live/matchmaking/*).
+//
+// The stock HSHO client plays peer-to-peer (SteamCoreSockets), so a room must
+// be creatable without a dedicated server: GAME_SERVER_HOST/GAME_SERVER_PORT
+// are optional and are only merged into the payload when a real dedicated
+// server is configured. Rooms are persisted in the existing admin_documents
+// tables (the collection is created on demand), which keeps the room system
+// working even when schema.sql has not been applied yet and survives Render
+// restarts. Matchmaking pairs the first two players searching for the same
+// game mode into a fresh room; players poll /live/matchmaking/status for the
+// result.
+const ROOMS_COLLECTION = 'game_rooms';
+const MATCH_QUEUE_TTL_MS = 120000;
+let roomsCollectionId = null;
+const matchQueue = [];
+
+async function roomsCollection() {
+  if (!supabase) throw new Error('Game database is not configured');
+  if (roomsCollectionId) return roomsCollectionId;
+  const { data: dbRow, error: dbError } = await supabase.from('admin_databases').select('id').eq('name', 'HSHO-PrivateServer').single();
+  if (dbError) throw dbError;
+  const { data: existing, error: findError } = await supabase.from('admin_collections')
+    .select('id').eq('database_id', dbRow.id).eq('name', ROOMS_COLLECTION).maybeSingle();
+  if (findError) throw findError;
+  if (existing) { roomsCollectionId = existing.id; return roomsCollectionId; }
+  const { data: created, error: createError } = await supabase.from('admin_collections')
+    .insert({ database_id: dbRow.id, name: ROOMS_COLLECTION }).select('id').single();
+  if (createError) throw createError;
+  recordAdminLog('info', 'Matchmaking', `Created the ${ROOMS_COLLECTION} collection for game rooms`, 200);
+  roomsCollectionId = created.id;
+  return roomsCollectionId;
+}
+
+async function listRoomDocuments() {
+  const cid = await roomsCollection();
+  const { data, error } = await supabase.from('admin_documents')
+    .select('id,data,created_at').eq('collection_id', cid).order('created_at', { ascending: false }).limit(300);
+  if (error) throw error;
+  return (data || [])
+    .filter(row => row.data && typeof row.data === 'object' && !Array.isArray(row.data))
+    .map(row => ({ ...row.data, docId: row.id }));
+}
+
+async function persistRoom(room) {
+  room.updated_at = new Date().toISOString();
+  if (room.docId) {
+    const { docId, ...stored } = room;
+    const { error } = await supabase.from('admin_documents').update({ data: stored }).eq('id', docId);
+    if (error) throw error;
+    return room;
+  }
+  const cid = await roomsCollection();
+  const { docId, ...stored } = room;
+  const { data, error } = await supabase.from('admin_documents').insert({ collection_id: cid, data: stored }).select('id').single();
+  if (error) throw error;
+  room.docId = data.id;
+  return room;
+}
+
+function newRoomCode() { return crypto.randomBytes(3).toString('hex').toUpperCase(); }
+
+function roomMembers(room) {
+  return (Array.isArray(room.members) ? room.members : []).map(member => ({
+    steamId: String(member.steam_id || ''),
+    displayName: String(member.display_name || 'Player'),
+    joinedAt: member.joined_at || null,
+    isHost: String(member.steam_id || '') === String(room.host_steam_id || ''),
+  }));
+}
+
+async function roomLobbyPayload(room) {
+  const serverTarget = await configuredGameServerTarget().catch(() => null);
+  const members = roomMembers(room);
+  const lobby = {
+    id: room.room_code,
+    room_code: room.room_code,
+    name: room.name,
+    game_mode: room.game_mode || 'default',
+    region: room.region || 'auto',
+    max_players: Number(room.max_players || 5),
+    status: room.status || 'open',
+    host_steam_id: room.host_steam_id || null,
+    member_count: members.length,
+    members,
+    ...(serverTarget || {}),
+  };
   return {
-    ...result,
-    ...(lobby ? { lobby: { ...lobby, ...serverTarget }, lobbyId: lobby.id, roomId: lobby.room_code || lobby.id } : {}),
+    lobby,
+    lobbyId: lobby.room_code,
+    roomId: lobby.room_code,
+    roomCode: lobby.room_code,
+    members,
+    memberCount: members.length,
+    hostSteamId: lobby.host_steam_id,
+    gameMode: lobby.game_mode,
+    region: lobby.region,
     ...(serverTarget || {}),
   };
 }
 
-async function gameRpc(req, res, rpcName, args, { requireServer = false, includeServerTarget = true } = {}) {
+async function respondRoom(req, res, action) {
   try {
     if (!supabase) return gameError(res, 503, 'Game database is not configured');
     await respondWithAuthedGamePlayer(req, res, async player => {
-      const serverTarget = includeServerTarget || requireServer ? await configuredGameServerTarget() : null;
-      if (requireServer && !serverTarget) return gameError(res, 503, 'Dedicated game server host and port are not configured');
-      const { data, error } = await supabase.rpc(rpcName, { p_steam_id: player.steamId, ...args,
-        ...(includeServerTarget && serverTarget ? { p_server_ip: serverTarget.serverIp, p_server_port: serverTarget.serverPort } : {}) });
-      if (error) {
-        recordAdminLog('warn', 'Matchmaking', `${rpcName} failed (${error.code || 'database error'})`, 409);
-        return gameError(res, error.code === 'P0001' ? 409 : 503, error.code === 'P0001' ? cleanRoomText(error.message, 120) : 'Matchmaking request failed');
+      try {
+        const data = await action(player);
+        if (res.headersSent || data === undefined) return;
+        res.set('Cache-Control', 'no-store').status(200).json({ status: 1, data, error: null });
+      } catch (error) {
+        console.error('[Room]', error.message);
+        recordAdminLog('error', 'Matchmaking', `Room request failed: ${String(error.message).slice(0, 160)}`, 503);
+        if (!res.headersSent) gameError(res, 503, 'Room service could not complete the request');
       }
-      const payload = normalizeGameLobbyResult(data, serverTarget);
-      res.set('Cache-Control', 'no-store').status(200).json({ status: 1, data: payload, error: null });
     });
   } catch (error) {
-    console.error(`[${rpcName}]`, error.message);
-    recordAdminLog('error', 'Matchmaking', `${rpcName} could not complete`, 503);
-    if (!res.headersSent) gameError(res, 503, 'Matchmaking request could not complete');
+    console.error('[Room]', error.message);
+    if (!res.headersSent) gameError(res, 503, 'Room service could not complete the request');
   }
+}
+
+function pruneMatchQueue(now = Date.now()) {
+  for (let i = matchQueue.length - 1; i >= 0; i--) {
+    if (now - matchQueue[i].at > MATCH_QUEUE_TTL_MS) matchQueue.splice(i, 1);
+  }
+}
+function removeFromQueue(steamId) {
+  for (let i = matchQueue.length - 1; i >= 0; i--) if (matchQueue[i].steamId === steamId) matchQueue.splice(i, 1);
+}
+function queueView(now = Date.now()) {
+  pruneMatchQueue(now);
+  return matchQueue.map((entry, index) => ({
+    position: index + 1,
+    gameMode: entry.gameMode,
+    region: entry.region,
+    waitSeconds: Math.round((now - entry.at) / 1000),
+  }));
 }
 
 async function serveGamePlayerProfile(req, res) {
@@ -773,47 +885,181 @@ async function serveGamePlayerProfile(req, res) {
 app.get('/live/player/profile', serveGamePlayerProfile);
 app.post('/live/player/profile', serveGamePlayerProfile);
 
-app.post('/live/lobby/create', async (req, res) => {
-  const target = await configuredGameServerTarget().catch(() => null);
-  if (!target) return gameError(res, 503, 'Configure GAME_SERVER_HOST and GAME_SERVER_PORT before creating game lobbies');
+// Save Data read aliases. Depending on the client build the game loads a
+// player's save from /live/player/save (GET), /live/player/load or a
+// savedata path; register the known read routes here so a load never falls
+// through to the generic "not implemented" handler and the game always
+// receives the persisted Save Data document.
+const PLAYER_SAVE_LOAD_PATHS = [
+  '/live/player/save/get', '/live/player/save/load', '/live/player/load',
+  '/live/player/savedata/get', '/live/player/savedata/read', '/live/player/get',
+  '/live/save/get', '/live/save/load',
+];
+app.get(PLAYER_SAVE_LOAD_PATHS, serveGamePlayerProfile);
+app.post(PLAYER_SAVE_LOAD_PATHS, serveGamePlayerProfile);
+app.get(['/live/player/save', '/live/player/savegame', '/live/player/savedata'], serveGamePlayerProfile);
+
+// Rooms do not require GAME_SERVER_HOST/GAME_SERVER_PORT: the stock client is
+// peer-to-peer, so the dedicated-server target stays optional.
+app.post('/live/lobby/create', (req, res) => respondRoom(req, res, async player => {
   const body = req.body && typeof req.body === 'object' ? req.body : {};
-  const name = cleanRoomText(body.roomName ?? body.room_name ?? body.name ?? 'HSHO Room', 48);
+  const name = cleanRoomText(body.roomName ?? body.room_name ?? body.name ?? 'HSHO Room', 48) || 'HSHO Room';
   const gameMode = cleanRoomText(body.gameMode ?? body.game_mode ?? body.mode ?? 'default', 32) || 'default';
   const region = cleanRoomText(body.region ?? 'auto', 24) || 'auto';
   const displayName = cleanRoomText(body.displayName ?? body.playerName ?? 'Player', 32) || 'Player';
   const maxPlayers = Number(body.maxPlayers ?? body.max_players ?? 5);
   if (!Number.isInteger(maxPlayers) || maxPlayers < 2 || maxPlayers > 16) return gameError(res, 400, 'maxPlayers must be an integer from 2 to 16');
-  return gameRpc(req, res, 'game_room_create', { p_name: name, p_game_mode: gameMode, p_region: region, p_max_players: maxPlayers, p_display_name: displayName }, { requireServer: true });
-});
+  const now = new Date().toISOString();
+  const room = {
+    kind: 'room',
+    room_code: newRoomCode(),
+    name,
+    game_mode: gameMode,
+    region,
+    max_players: maxPlayers,
+    host_steam_id: player.steamId,
+    host_name: displayName,
+    status: 'open',
+    created_at: now,
+    updated_at: now,
+    members: [{ steam_id: player.steamId, display_name: displayName, joined_at: now }],
+  };
+  await persistRoom(room);
+  removeFromQueue(player.steamId);
+  recordAdminLog('info', 'Matchmaking', `Room created; code=${room.room_code}; mode=${gameMode}; players=1/${maxPlayers}`, 200);
+  return roomLobbyPayload(room);
+}));
 
-app.post('/live/matchmaking/search', async (req, res) => {
+// Search pairs the first waiting player of the same game mode into a new room;
+// otherwise the caller enters the queue and polls /live/matchmaking/status.
+app.post(['/live/matchmaking/search', '/live/matchmaking/find'], (req, res) => respondRoom(req, res, async player => {
   const body = req.body && typeof req.body === 'object' ? req.body : {};
-  const target = await configuredGameServerTarget().catch(() => null);
-  return gameRpc(req, res, 'game_matchmaking_search', {
-    p_game_mode: cleanRoomText(body.gameMode ?? body.game_mode ?? body.mode ?? 'default', 32) || 'default',
-    p_region: cleanRoomText(body.region ?? 'auto', 24) || 'auto',
-    p_display_name: cleanRoomText(body.displayName ?? body.playerName ?? 'Player', 32) || 'Player',
-    p_server_ip: target?.serverIp || null, p_server_port: target?.serverPort || null,
-  });
-});
+  const gameMode = cleanRoomText(body.gameMode ?? body.game_mode ?? body.mode ?? 'default', 32) || 'default';
+  const region = cleanRoomText(body.region ?? 'auto', 24) || 'auto';
+  const displayName = cleanRoomText(body.displayName ?? body.playerName ?? 'Player', 32) || 'Player';
+  const now = Date.now();
+  removeFromQueue(player.steamId);
+  pruneMatchQueue(now);
+  const partnerIndex = matchQueue.findIndex(entry =>
+    entry.steamId !== player.steamId &&
+    entry.gameMode === gameMode &&
+    (region === 'auto' || entry.region === 'auto' || entry.region === region));
+  if (partnerIndex >= 0) {
+    const [partner] = matchQueue.splice(partnerIndex, 1);
+    const at = new Date().toISOString();
+    const room = {
+      kind: 'room',
+      room_code: newRoomCode(),
+      name: `${gameMode} Match`,
+      game_mode: gameMode,
+      region: region === 'auto' || partner.region === 'auto' ? 'auto' : region,
+      max_players: 5,
+      host_steam_id: partner.steamId,
+      host_name: partner.displayName,
+      status: 'playing',
+      created_at: at,
+      updated_at: at,
+      members: [
+        { steam_id: partner.steamId, display_name: partner.displayName, joined_at: at },
+        { steam_id: player.steamId, display_name: displayName, joined_at: at },
+      ],
+    };
+    await persistRoom(room);
+    recordAdminLog('info', 'Matchmaking', `Matched two players; code=${room.room_code}; mode=${gameMode}`, 200);
+    return { matched: true, searching: false, ...(await roomLobbyPayload(room)) };
+  }
+  matchQueue.push({ steamId: player.steamId, displayName, gameMode, region, at: now });
+  recordAdminLog('info', 'Matchmaking', `Player entered matchmaking queue; mode=${gameMode}; waiting=${matchQueue.length}`, 200);
+  return { matched: false, searching: true, game_mode: gameMode, region, queue: queueView(now), poll_after_ms: 3000 };
+}));
 
-app.post('/live/lobby/join', async (req, res) => {
+app.post('/live/matchmaking/cancel', (req, res) => respondRoom(req, res, async player => {
+  removeFromQueue(player.steamId);
+  recordAdminLog('info', 'Matchmaking', 'Player left the matchmaking queue', 200);
+  return { cancelled: true, searching: false, queue: queueView() };
+}));
+
+app.post(['/live/matchmaking/status', '/live/lobby/status'], (req, res) => respondRoom(req, res, async player => {
+  const now = Date.now();
+  pruneMatchQueue(now);
+  const rooms = await listRoomDocuments();
+  const mine = rooms.find(room =>
+    (Array.isArray(room.members) ? room.members : []).some(member => member.steam_id === player.steamId) &&
+    room.status !== 'closed');
+  if (mine) return { ...(await roomLobbyPayload(mine)), matched: true, searching: false, in_room: true };
+  const queueIndex = matchQueue.findIndex(entry => entry.steamId === player.steamId);
+  return {
+    matched: false,
+    searching: queueIndex >= 0,
+    queue_position: queueIndex >= 0 ? queueIndex + 1 : null,
+    queue: queueView(now),
+    poll_after_ms: 3000,
+  };
+}));
+
+app.post('/live/lobby/join', (req, res) => respondRoom(req, res, async player => {
   const body = req.body && typeof req.body === 'object' ? req.body : {};
   const lobbyKey = cleanRoomText(body.lobbyId ?? body.lobby_id ?? body.roomId ?? body.roomCode ?? body.room_code ?? body.id ?? '', 64);
   if (!lobbyKey) return gameError(res, 400, 'lobbyId or roomCode is required');
-  const target = await configuredGameServerTarget().catch(() => null);
-  return gameRpc(req, res, 'game_room_join', { p_lobby_key: lobbyKey, p_display_name: cleanRoomText(body.displayName ?? body.playerName ?? 'Player', 32) || 'Player', p_server_ip: target?.serverIp || null, p_server_port: target?.serverPort || null });
-});
+  const displayName = cleanRoomText(body.displayName ?? body.playerName ?? 'Player', 32) || 'Player';
+  const rooms = await listRoomDocuments();
+  const room = rooms.find(candidate =>
+    String(candidate.room_code || '').toLowerCase() === lobbyKey.toLowerCase() ||
+    String(candidate.lobbyId || candidate.id || '').toLowerCase() === lobbyKey.toLowerCase());
+  if (!room) return gameError(res, 404, 'Room was not found');
+  if (room.status === 'closed') return gameError(res, 409, 'Room is closed');
+  const members = Array.isArray(room.members) ? room.members : [];
+  if (!members.some(member => member.steam_id === player.steamId)) {
+    if (members.length >= Number(room.max_players || 5)) return gameError(res, 409, 'Room is full');
+    room.members = [...members, { steam_id: player.steamId, display_name: displayName, joined_at: new Date().toISOString() }];
+    await persistRoom(room);
+  }
+  removeFromQueue(player.steamId);
+  recordAdminLog('info', 'Matchmaking', `Player joined room; code=${room.room_code}; players=${room.members.length}/${room.max_players}`, 200);
+  return roomLobbyPayload(room);
+}));
 
-app.post('/live/lobby/leave', async (req, res) => {
+app.post('/live/lobby/leave', (req, res) => respondRoom(req, res, async player => {
   const body = req.body && typeof req.body === 'object' ? req.body : {};
   const lobbyKey = cleanRoomText(body.lobbyId ?? body.lobby_id ?? body.roomId ?? body.roomCode ?? body.room_code ?? body.id ?? '', 64);
-  return gameRpc(req, res, 'game_room_leave', { p_lobby_key: lobbyKey || null }, { includeServerTarget: false });
-});
+  const rooms = await listRoomDocuments();
+  const room = lobbyKey
+    ? rooms.find(candidate => String(candidate.room_code || '').toLowerCase() === lobbyKey.toLowerCase())
+    : rooms.find(candidate => (Array.isArray(candidate.members) ? candidate.members : []).some(member => member.steam_id === player.steamId));
+  removeFromQueue(player.steamId);
+  if (!room) return { left: true, room_code: lobbyKey || null };
+  const members = (Array.isArray(room.members) ? room.members : []).filter(member => member.steam_id !== player.steamId);
+  room.members = members;
+  if (!members.length) {
+    room.status = 'closed';
+  } else if (room.host_steam_id === player.steamId) {
+    // The host left: hand hosting to the longest-serving remaining member.
+    room.host_steam_id = members[0].steam_id;
+    room.host_name = members[0].display_name;
+  }
+  await persistRoom(room);
+  recordAdminLog('info', 'Matchmaking', `Player left room; code=${room.room_code}; players=${members.length}/${room.max_players}; status=${room.status}`, 200);
+  return { left: true, room_code: room.room_code, status: room.status, member_count: members.length };
+}));
 
-app.post('/live/matchmaking/cancel', async (req, res) => gameRpc(req, res, 'game_matchmaking_cancel', {}, { includeServerTarget: false }));
-app.post(['/live/matchmaking/status', '/live/lobby/status'], async (req, res) =>
-  gameRpc(req, res, 'game_matchmaking_status', {}, { includeServerTarget: false }));
+// Room browser for the launcher/game UI: lists open rooms of a game mode.
+app.get(['/live/lobby/list', '/live/lobby/search'], (req, res) => respondRoom(req, res, async () => {
+  const gameMode = cleanRoomText(req.query.gameMode ?? req.query.game_mode ?? req.query.mode, 32);
+  const rooms = await listRoomDocuments();
+  const open = rooms.filter(room => room.status !== 'closed' && (!gameMode || gameMode === 'default' || room.game_mode === gameMode));
+  const lobbies = [];
+  for (const room of open.slice(0, 50)) lobbies.push(await roomLobbyPayload(room));
+  return { rooms: lobbies, lobbies, count: lobbies.length };
+}));
+app.post(['/live/lobby/list', '/live/lobby/search'], (req, res) => respondRoom(req, res, async () => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const gameMode = cleanRoomText(body.gameMode ?? body.game_mode ?? body.mode, 32);
+  const rooms = await listRoomDocuments();
+  const open = rooms.filter(room => room.status !== 'closed' && (!gameMode || gameMode === 'default' || room.game_mode === gameMode));
+  const lobbies = [];
+  for (const room of open.slice(0, 50)) lobbies.push(await roomLobbyPayload(room));
+  return { rooms: lobbies, lobbies, count: lobbies.length };
+}));
 
 app.use('/', gameHealthRoutes);
 // The game API adapters in src use Supabase repositories and static JSON rows.
@@ -1112,7 +1358,7 @@ async function handleGameSaveRequest(req, res) {
     if (!res.headersSent) gameError(res, invalid ? 400 : 503, invalid ? error.message : 'Player data could not be saved');
   }
 }
-app.post(['/live/player/save','/live/player/updateLoadout','/live/profile/save','/live/inventory/update'], handleGameSaveRequest);
+app.post(['/live/player/save', '/live/player/savegame', '/live/player/savedata', '/live/player/updateLoadout', '/live/profile/save', '/live/inventory/update'], handleGameSaveRequest);
 // Authenticated Save Data API. The SteamID always comes from the validated
 // session; callers cannot read or overwrite another player's row by changing
 // a request-body SteamID. Currency, inventory, whitelist, ban, and session
@@ -1427,6 +1673,20 @@ app.use(['/live', '/logapi'], (req, res) => {
       const serialized = JSON.stringify(safeBody || {});
       if (!safeBody || !Object.keys(safeBody).length || Buffer.byteLength(serialized, 'utf8') > 500 * 1024) return;
       await respondWithAuthedGamePlayer(req, res, async player => {
+        // First try to apply the recognized Save Data fields: several client
+        // builds post their save to an unmapped path, and discarding that only
+        // copy is a common reason a player's Save Data stays empty.
+        let applied = {};
+        try { applied = await persistGameCustomization(player, rawBody); }
+        catch (error) { recordAdminLog('warn', 'Player Save', `Unmapped write rejected: ${String(error.message).slice(0, 160)}`, 400); }
+        if (Object.keys(applied).length) {
+          const row = whitelistRepository ? await whitelistRepository.findBySteamId(player.steamId) : null;
+          const profile = playerSaveDocument(row || {});
+          profile.steamid = player.steamId;
+          recordAdminLog('info', 'Player Save', `Applied unmapped write ${req.method} ${path}; persisted=${Object.keys(applied).join(',')}`, 200);
+          res.set('Cache-Control', 'no-store').status(200).json({ status: 1, success: true, data: { profile }, error: null });
+          return;
+        }
         const prior = player.save_data && typeof player.save_data === 'object' && !Array.isArray(player.save_data)
           ? player.save_data : {};
         player.save_data = {
