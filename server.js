@@ -536,7 +536,7 @@ const handleSteamGameAuth = async (req, res) => {
     const webApiKey = String(process.env.STEAM_WEB_API_KEY || '').trim();
     const publisherKey = String(process.env.STEAM_PUBLISHER_KEY || '').trim();
     const steamApiKey = webApiKey || publisherKey;
-    // This game uses Steam App ID 480; allow Render to override it if needed.
+    // App ID 480 is used for this deployment's Steam tickets; allow override.
     const appId = String(process.env.STEAM_APP_ID || '480').trim();
     const defaultSteamHost = publisherKey && !webApiKey ? 'partner.steam-api.com' : 'api.steampowered.com';
     const steamHost = String(process.env.STEAM_API_HOST || defaultSteamHost).trim().toLowerCase();
@@ -569,8 +569,9 @@ const handleSteamGameAuth = async (req, res) => {
       const safeValue = value => String(value ?? 'unknown').replace(/[^a-zA-Z0-9_. -]/g, '').slice(0, 48) || 'unknown';
       const result = safeValue(steamParams.result ?? steamParams.resultcode);
       const errorCode = safeValue(steamError.errorcode ?? steamPayload?.error?.errorcode);
+      const errorDescription = safeValue(steamError.errordesc ?? steamError.error_description ?? steamPayload?.error?.errordesc);
       const responseFields = Object.keys(steamParams).slice(0, 12).join(',') || '(none)';
-      recordAdminLog('warn', 'Steam Auth', `Steam rejected ticket; result=${result}; error_code=${errorCode}; response_fields=${responseFields}`, 401);
+      recordAdminLog('warn', 'Steam Auth', `Steam rejected ticket; result=${result}; error_code=${errorCode}; error_desc=${errorDescription}; response_fields=${responseFields}`, 401);
       return gameError(res, 401, 'Steam rejected the session ticket');
     }
 
