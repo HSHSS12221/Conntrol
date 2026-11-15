@@ -13,6 +13,8 @@ const PlayerModel = require('./src/models/player.model');
 const ServerInfoModel = require('./src/models/server.model');
 const staticJsonUtil = require('./src/utils/static-json.util');
 const gameHealthRoutes = require('./src/Health');
+const { createPlayerSaveDataFile } = require('./src/data/Player.Save.Data');
+const { createMatchmakingDataFile } = require('./src/data/Matchmaking.Data');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -102,6 +104,11 @@ const supabase = SUPABASE_URL && supabaseServerKey
 const gameDataService = supabase ? createGameDataService(supabase) : null;
 const whitelistRepository = supabase ? createWhitelistRepository(supabase) : null;
 if (supabase) { PlayerModel.configure(supabase); ServerInfoModel.configure(supabase); staticJsonUtil.configure(supabase); gameHealthRoutes.configure(supabase); }
+// File stores in the admin explorer's `data` collection: the game's durable
+// Save Data (Player.Save.Data) and the matchmaking queue snapshot
+// (Matchmaking.Data). Both create their documents lazily on first use.
+const playerSaveDataFile = createPlayerSaveDataFile({ supabase, log: recordAdminLog });
+const matchmakingDataFile = createMatchmakingDataFile({ supabase, log: recordAdminLog });
 const db = {
   collection(table) {
     return {
@@ -844,7 +851,9 @@ function pruneMatchQueue(now = Date.now()) {
   }
 }
 function removeFromQueue(steamId) {
-  for (let i = matchQueue.length - 1; i >= 0; i--) if (matchQueue[i].steamId === steamId) matchQueue.splice(i, 1);
+  let removed = false;
+  for (let i = matchQueue.length - 1; i >= 0; i--) if (matchQueue[i].steamId === steamId) { matchQueue.splice(i, 1); removed = true; }
+  return removed;
 }
 function queueView(now = Date.now()) {
   pruneMatchQueue(now);
@@ -856,24 +865,125 @@ function queueView(now = Date.now()) {
   }));
 }
 
+// The Matchmaking.Data file keeps the queue across Render restarts. The
+// in-memory array remains authoritative while the process lives; the file is
+// loaded lazily on the first matchmaking request and rewritten after every
+// change so a cold start restores whoever was still searching.
+let matchQueueLoadPromise = null;
+async function loadMatchQueue() {
+  if (!matchmakingDataFile) return;
+  if (!matchQueueLoadPromise) {
+    matchQueueLoadPromise = (async () => {
+      const stored = await matchmakingDataFile.loadQueue();
+      const now = Date.now();
+      let restored = 0;
+      for (const entry of stored) {
+        if (now - Number(entry.at) > MATCH_QUEUE_TTL_MS) continue;
+        if (matchQueue.some(queued => queued.steamId === entry.steamId)) continue;
+        matchQueue.push({
+          steamId: String(entry.steamId),
+          displayName: String(entry.displayName || 'Player'),
+          gameMode: String(entry.gameMode || 'default'),
+          region: String(entry.region || 'auto'),
+          at: Number(entry.at),
+        });
+        restored += 1;
+      }
+      if (restored) recordAdminLog('info', 'Matchmaking', `Restored ${restored} queued player(s) from the Matchmaking.Data file`, 200);
+    })().catch(error => {
+      matchQueueLoadPromise = null; // retry on the next matchmaking request
+      console.error('[Matchmaking] Matchmaking.Data read failed:', error.message);
+      recordAdminLog('warn', 'Matchmaking', `Matchmaking.Data read failed: ${String(error.message).slice(0, 160)}`, 500);
+    });
+  }
+  await matchQueueLoadPromise;
+}
+function persistMatchQueue() {
+  if (!matchmakingDataFile) return;
+  matchmakingDataFile.saveQueue(matchQueue).catch(error => {
+    console.error('[Matchmaking] Matchmaking.Data write failed:', error.message);
+    recordAdminLog('error', 'Matchmaking', `Matchmaking.Data write failed: ${String(error.message).slice(0, 160)}`, 500);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Player.Save.Data file integration. Reads overlay the file's save document
+// onto the whitelists-based document; writes mirror the save into the file,
+// so data survives even when the whitelists save_data columns are missing
+// (the columns schema.sql adds).
+// ---------------------------------------------------------------------------
+// Values the server owns are never taken from the file, so admin-panel edits
+// to currencies, moderation, whitelist, and session fields are not shadowed
+// by an older save snapshot. Game-owned state (save snapshot, slots,
+// profile, record, ...) does come from the file when present.
+const SAVE_FILE_SERVER_MANAGED_KEYS = new Set([
+  'steamid', 'steam_id', '_id', 'id', 'auth', 'session_token', 'sessionToken',
+  'player_name', 'discord_id', 'status', 'notes', 'banStatus', 'ban_status',
+  'coin', 'amethyst', 'amulet', 'role', 'inventory', 'isOnline', 'is_online', 'lastOnline', 'last_online',
+  'save_updated_at', 'save_source', 'createdAt', 'updatedAt', '_exists',
+]);
+
+async function applyPlayerSaveFile(document, steamId) {
+  if (!playerSaveDataFile) return document;
+  try {
+    const stored = await playerSaveDataFile.read(steamId);
+    if (stored && typeof stored === 'object') {
+      for (const [key, value] of Object.entries(stored)) {
+        if (SAVE_FILE_SERVER_MANAGED_KEYS.has(key)) continue;
+        document[key] = value;
+      }
+    }
+  } catch (error) {
+    console.error('[Player Save] Player.Save.Data read failed:', error.message);
+    recordAdminLog('warn', 'Player Save', `Player.Save.Data read failed: ${String(error.message).slice(0, 160)}`, 500);
+  }
+  return document;
+}
+
+async function writePlayerSaveFile(player, knownRow = null) {
+  if (!playerSaveDataFile) return;
+  try {
+    // Rebuild a whitelists-row shaped snapshot from the in-memory player:
+    // it carries the row fields plus the just-applied save, so the file is
+    // correct whether or not the whitelists write succeeded.
+    const row = knownRow || await whitelistRepository.findBySteamId(player.steamId);
+    const snapshotRow = {
+      ...(row || {}),
+      save_data: player.save_data || row?.save_data || {},
+      profile: player.profile ?? row?.profile ?? {},
+      character_slot: player.characterSlot ?? row?.character_slot ?? null,
+      sticker_slot: player.stickerSlot ?? row?.sticker_slot ?? null,
+      player_record: player.playerRecord ?? row?.player_record ?? null,
+      immortal_data: player.immortalData ?? row?.immortal_data ?? [],
+      inventory: player.inventory ?? row?.inventory ?? null,
+      game_data: { ...(row && typeof row.game_data === 'object' ? row.game_data : {}), ...PlayerModel.toGameData(player) },
+    };
+    await playerSaveDataFile.write(player.steamId, playerSaveDocument(snapshotRow));
+  } catch (error) {
+    console.error('[Player Save] Player.Save.Data write failed:', error.message);
+    recordAdminLog('error', 'Player Save', `Player.Save.Data write failed: ${String(error.message).slice(0, 160)}`, 500);
+  }
+}
+
 async function serveGamePlayerProfile(req, res) {
   try {
     await respondWithAuthedGamePlayer(req, res, async player => {
       const row = await whitelistRepository.findBySteamId(player.steamId);
       if (!row) return gameError(res, 404, 'Player save was not found');
       const playerData = playerSaveDocument(row);
+      await applyPlayerSaveFile(playerData, player.steamId);
       playerData.steamid = player.steamId;
       const data = {
         player: playerData,
-        profile: row.profile || {},
-        level: Number(row.profile?.level ?? row.game_data?.level ?? 0),
-        mmr: Number(row.profile?.mmr ?? row.game_data?.mmr ?? 0),
+        profile: playerData.profile || row.profile || {},
+        level: Number(playerData.profile?.level ?? row.game_data?.level ?? 0),
+        mmr: Number(playerData.profile?.mmr ?? row.game_data?.mmr ?? 0),
         currencies: { coin: Number(row.coin || 0), amethyst: Number(row.amethyst || 0), amulet: Number(row.amulet || 0) },
-        characterSlot: row.character_slot || null,
-        stickerSlot: row.sticker_slot || null,
-        inventory: row.inventory || null,
-        playerRecord: row.player_record || null,
-        immortalData: row.immortal_data || [],
+        characterSlot: (playerData.characterSlot ?? row.character_slot) || null,
+        stickerSlot: (playerData.stickerSlot ?? row.sticker_slot) || null,
+        inventory: (playerData.inventory ?? row.inventory) || null,
+        playerRecord: (playerData.playerRecord ?? row.player_record) || null,
+        immortalData: (playerData.immortalData ?? row.immortal_data) || [],
       };
       res.set('Cache-Control', 'no-store').json({ status: 1, data, error: null });
     });
@@ -925,7 +1035,8 @@ app.post('/live/lobby/create', (req, res) => respondRoom(req, res, async player 
     members: [{ steam_id: player.steamId, display_name: displayName, joined_at: now }],
   };
   await persistRoom(room);
-  removeFromQueue(player.steamId);
+  await loadMatchQueue();
+  if (removeFromQueue(player.steamId)) persistMatchQueue();
   recordAdminLog('info', 'Matchmaking', `Room created; code=${room.room_code}; mode=${gameMode}; players=1/${maxPlayers}`, 200);
   return roomLobbyPayload(room);
 }));
@@ -938,7 +1049,8 @@ app.post(['/live/matchmaking/search', '/live/matchmaking/find'], (req, res) => r
   const region = cleanRoomText(body.region ?? 'auto', 24) || 'auto';
   const displayName = cleanRoomText(body.displayName ?? body.playerName ?? 'Player', 32) || 'Player';
   const now = Date.now();
-  removeFromQueue(player.steamId);
+  await loadMatchQueue();
+  if (removeFromQueue(player.steamId)) persistMatchQueue();
   pruneMatchQueue(now);
   const partnerIndex = matchQueue.findIndex(entry =>
     entry.steamId !== player.steamId &&
@@ -946,6 +1058,7 @@ app.post(['/live/matchmaking/search', '/live/matchmaking/find'], (req, res) => r
     (region === 'auto' || entry.region === 'auto' || entry.region === region));
   if (partnerIndex >= 0) {
     const [partner] = matchQueue.splice(partnerIndex, 1);
+    persistMatchQueue();
     const at = new Date().toISOString();
     const room = {
       kind: 'room',
@@ -969,17 +1082,21 @@ app.post(['/live/matchmaking/search', '/live/matchmaking/find'], (req, res) => r
     return { matched: true, searching: false, ...(await roomLobbyPayload(room)) };
   }
   matchQueue.push({ steamId: player.steamId, displayName, gameMode, region, at: now });
+  persistMatchQueue();
   recordAdminLog('info', 'Matchmaking', `Player entered matchmaking queue; mode=${gameMode}; waiting=${matchQueue.length}`, 200);
   return { matched: false, searching: true, game_mode: gameMode, region, queue: queueView(now), poll_after_ms: 3000 };
 }));
 
 app.post('/live/matchmaking/cancel', (req, res) => respondRoom(req, res, async player => {
-  removeFromQueue(player.steamId);
+  await loadMatchQueue();
+  const cancelled = removeFromQueue(player.steamId);
+  if (cancelled) persistMatchQueue();
   recordAdminLog('info', 'Matchmaking', 'Player left the matchmaking queue', 200);
   return { cancelled: true, searching: false, queue: queueView() };
 }));
 
 app.post(['/live/matchmaking/status', '/live/lobby/status'], (req, res) => respondRoom(req, res, async player => {
+  await loadMatchQueue();
   const now = Date.now();
   pruneMatchQueue(now);
   const rooms = await listRoomDocuments();
@@ -1014,7 +1131,8 @@ app.post('/live/lobby/join', (req, res) => respondRoom(req, res, async player =>
     room.members = [...members, { steam_id: player.steamId, display_name: displayName, joined_at: new Date().toISOString() }];
     await persistRoom(room);
   }
-  removeFromQueue(player.steamId);
+  await loadMatchQueue();
+  if (removeFromQueue(player.steamId)) persistMatchQueue();
   recordAdminLog('info', 'Matchmaking', `Player joined room; code=${room.room_code}; players=${room.members.length}/${room.max_players}`, 200);
   return roomLobbyPayload(room);
 }));
@@ -1026,7 +1144,8 @@ app.post('/live/lobby/leave', (req, res) => respondRoom(req, res, async player =
   const room = lobbyKey
     ? rooms.find(candidate => String(candidate.room_code || '').toLowerCase() === lobbyKey.toLowerCase())
     : rooms.find(candidate => (Array.isArray(candidate.members) ? candidate.members : []).some(member => member.steam_id === player.steamId));
-  removeFromQueue(player.steamId);
+  await loadMatchQueue();
+  if (removeFromQueue(player.steamId)) persistMatchQueue();
   if (!room) return { left: true, room_code: lobbyKey || null };
   const members = (Array.isArray(room.members) ? room.members : []).filter(member => member.steam_id !== player.steamId);
   room.members = members;
@@ -1344,11 +1463,23 @@ async function handleGameSaveRequest(req, res) {
     const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
     if (Buffer.byteLength(JSON.stringify(body), 'utf8') > 512 * 1024) return gameError(res, 413, 'Player save payload is too large');
     await respondWithAuthedGamePlayer(req, res, async player => {
-      const updated = await persistGameCustomization(player, body);
+      let updated = {};
+      try {
+        updated = await persistGameCustomization(player, body);
+      } catch (error) {
+        // Invalid payloads stay client errors. Persistence failures (for
+        // example a database missing the save_data columns that schema.sql
+        // adds) fall through so the game's save is kept in the
+        // Player.Save.Data file instead of being dropped.
+        if (/must be|invalid|too large|character ID/i.test(error.message)) throw error;
+        recordAdminLog('warn', 'Player Save', `whitelists sync failed (${String(error.message).slice(0, 160)}); storing the save in the Player.Save.Data file`, 200);
+      }
       const row = await whitelistRepository.findBySteamId(player.steamId);
+      await writePlayerSaveFile(player, row);
       const profile = playerSaveDocument(row || {});
+      await applyPlayerSaveFile(profile, player.steamId);
       profile.steamid = player.steamId;
-      const saveMeta = row?.save_updated_at ? `; source=${row.save_source || 'unknown'}; savedAt=${row.save_updated_at}` : '; no persisted game Save Data received yet';
+      const saveMeta = row?.save_updated_at ? `; source=${row.save_source || 'unknown'}; savedAt=${row.save_updated_at}` : '; kept in the Player.Save.Data file';
       recordAdminLog(Object.keys(updated).length ? 'info' : 'warn', 'Player Save', `Received ${req.method} ${req.path}; fields=${listSafeGameFieldNames(body).join(',') || '(none)'}; persisted=${Object.keys(updated).join(',') || 'none'}${saveMeta}`, Object.keys(updated).length ? 200 : 200);
       res.set('Cache-Control', 'no-store').status(200).json({ success: true, status: 'success', code: 0, data: { profile } });
     });
@@ -1369,6 +1500,7 @@ app.post('/api/getPlayerData', async (req, res) => {
       const row = await whitelistRepository.findBySteamId(player.steamId);
       if (!row) return res.status(404).json({ success: false, error: 'Player save not found' });
       const data = playerSaveDocument(row);
+      await applyPlayerSaveFile(data, player.steamId);
       data.steamid = player.steamId;
       res.set('Cache-Control', 'no-store').json({ success: true, data });
     });
@@ -1394,56 +1526,67 @@ app.post('/api/savePlayerData', async (req, res) => {
         if (mutableColumns.has(column)) updates[column] = value;
       }
 
-      if (Object.hasOwn(updates, 'character_slot')) {
-        const slotData = updates.character_slot;
-        delete updates.character_slot;
-        await inventoryService.updateCharacterSlot(player, slotData);
-      }
-      if (Object.hasOwn(updates, 'profile')) player.profile = { ...(player.profile || {}), ...updates.profile };
-      if (Object.hasOwn(updates, 'sticker_slot')) player.stickerSlot = updates.sticker_slot;
-      if (Object.hasOwn(updates, 'player_record')) player.playerRecord = updates.player_record;
-      if (Object.hasOwn(updates, 'immortal_data')) player.immortalData = updates.immortal_data;
-      const safeSnapshot = sanitizeClientGameState(payload);
-      if (hasPlayerSaveState(safeSnapshot)) {
-        player.save_data = deepMergeSaveData(player.save_data || {}, safeSnapshot);
-        for (const [key, value] of Object.entries(safeSnapshot)) {
-          if (['profile','characterSlot','character_slot','stickerSlot','sticker_slot','playerRecord','player_record','immortalData','immortal_data'].includes(key)) continue;
-          if (key === 'PlayerSaveGame' && value && typeof value === 'object') player.PlayerSaveGame = deepMergeSaveData(player.PlayerSaveGame || {}, value);
-          else player[key] = value;
+      let saveFields = false;
+      try {
+        if (Object.hasOwn(updates, 'character_slot')) {
+          const slotData = updates.character_slot;
+          delete updates.character_slot;
+          await inventoryService.updateCharacterSlot(player, slotData);
         }
-        player.save_source = 'game';
-        player._saveDataWrite = true;
-      }
-      const saveFields = Object.keys(updates).length > 0 || hasPlayerSaveState(safeSnapshot);
-      if (saveFields) {
-        player.save_source = 'game';
-        player._saveDataWrite = true;
-        await player.save();
-        player._saveDataWrite = false;
-      }
-
-      // Store additional non-reserved game fields in JSONB, without allowing
-      // callers to smuggle identity, credentials, economy, or moderation fields.
-      const protectedKeys = /^(steam_?id|csteamid|playerid|playersessionid|auth|session_?token|access_?token|status|ban_?status|inventory|playerinventoryinfo|characterlist|coin|gem|token|lootboxamount|amethyst|amulet|role|is_?online|last_?online)$/i;
-      const extras = Object.fromEntries(Object.entries(split.game_data || {}).filter(([key]) => !protectedKeys.test(key)));
-      if (Object.keys(extras).length) {
-        for (const [key, value] of Object.entries(extras)) {
-          if (/^(playersavegame|s_player_info|playerinfo)$/i.test(key)) {
-            const customization = extractPlayerSaveGameCustomization({ [key]: value });
-            if (customization) mergePlayerSaveGame(player, customization);
-            continue;
+        if (Object.hasOwn(updates, 'profile')) player.profile = { ...(player.profile || {}), ...updates.profile };
+        if (Object.hasOwn(updates, 'sticker_slot')) player.stickerSlot = updates.sticker_slot;
+        if (Object.hasOwn(updates, 'player_record')) player.playerRecord = updates.player_record;
+        if (Object.hasOwn(updates, 'immortal_data')) player.immortalData = updates.immortal_data;
+        const safeSnapshot = sanitizeClientGameState(payload);
+        if (hasPlayerSaveState(safeSnapshot)) {
+          player.save_data = deepMergeSaveData(player.save_data || {}, safeSnapshot);
+          for (const [key, value] of Object.entries(safeSnapshot)) {
+            if (['profile','characterSlot','character_slot','stickerSlot','sticker_slot','playerRecord','player_record','immortalData','immortal_data'].includes(key)) continue;
+            if (key === 'PlayerSaveGame' && value && typeof value === 'object') player.PlayerSaveGame = deepMergeSaveData(player.PlayerSaveGame || {}, value);
+            else player[key] = value;
           }
-          player[key] = value;
+          player.save_source = 'game';
+          player._saveDataWrite = true;
         }
-        // Extras here came from the authenticated game save request too.
-        player.save_source = 'game';
-        player._saveDataWrite = true;
-        await player.save();
-        player._saveDataWrite = false;
+        saveFields = Object.keys(updates).length > 0 || hasPlayerSaveState(safeSnapshot);
+        if (saveFields) {
+          player.save_source = 'game';
+          player._saveDataWrite = true;
+          await player.save();
+          player._saveDataWrite = false;
+        }
+
+        // Store additional non-reserved game fields in JSONB, without allowing
+        // callers to smuggle identity, credentials, economy, or moderation fields.
+        const protectedKeys = /^(steam_?id|csteamid|playerid|playersessionid|auth|session_?token|access_?token|status|ban_?status|inventory|playerinventoryinfo|characterlist|coin|gem|token|lootboxamount|amethyst|amulet|role|is_?online|last_?online)$/i;
+        const extras = Object.fromEntries(Object.entries(split.game_data || {}).filter(([key]) => !protectedKeys.test(key)));
+        if (Object.keys(extras).length) {
+          for (const [key, value] of Object.entries(extras)) {
+            if (/^(playersavegame|s_player_info|playerinfo)$/i.test(key)) {
+              const customization = extractPlayerSaveGameCustomization({ [key]: value });
+              if (customization) mergePlayerSaveGame(player, customization);
+              continue;
+            }
+            player[key] = value;
+          }
+          // Extras here came from the authenticated game save request too.
+          player.save_source = 'game';
+          player._saveDataWrite = true;
+          await player.save();
+          player._saveDataWrite = false;
+        }
+      } catch (error) {
+        // Invalid payloads stay client errors. Persistence failures (for
+        // example a database missing the save_data columns) fall through so
+        // the save is kept in the Player.Save.Data file instead of being lost.
+        if (/must be|invalid|too large|character ID|contains invalid/i.test(error.message)) throw error;
+        recordAdminLog('warn', 'Player Save', `whitelists sync failed (${String(error.message).slice(0, 160)}); storing the save in the Player.Save.Data file`, 200);
       }
+      await writePlayerSaveFile(player);
 
       const savedRow = await whitelistRepository.findBySteamId(player.steamId);
       const data = playerSaveDocument(savedRow);
+      await applyPlayerSaveFile(data, player.steamId);
       data.steamid = player.steamId;
       recordAdminLog(saveFields ? 'info' : 'warn', 'Player Save', `Received ${req.method} ${req.path}; fields=${listSafeGameFieldNames(req.body).join(',') || '(none)'}; persisted=${saveFields ? Object.keys(updates).join(',') || 'game snapshot' : 'none'}`, 200);
       res.set('Cache-Control', 'no-store').json({ success: true, data });
@@ -1526,7 +1669,9 @@ app.post('/live/player/gameplay/endgameresult', async (req, res) => {
       // endgameresult rather than calling a dedicated save route. Persist the
       // recognized customization fields here as well; the helper merges slots
       // and ignores client-supplied currency/item ownership claims.
-      const savedCustomization = await persistGameCustomization(player, body);
+      let savedCustomization = {};
+      try {
+        savedCustomization = await persistGameCustomization(player, body);
       // Keep an inspectable, bounded copy of the end-match payload in the
       // Save Data JSONB too. A number of client builds send results without
       // their outfit fields; storing this safe diagnostic snapshot lets the
@@ -1550,8 +1695,19 @@ app.post('/live/player/gameplay/endgameresult', async (req, res) => {
       player.lastGameResult = snapshot;
       player.lastGameResultAt = new Date().toISOString();
       await player.save();
+      } catch (error) {
+        // Invalid payloads stay client errors. A failed whitelists write (for
+        // example a database missing the save_data columns) falls through so
+        // the end-game save is kept in the Player.Save.Data file instead.
+        if (/must be|invalid|too large|character ID|contains invalid/i.test(error.message)) throw error;
+        recordAdminLog('warn', 'Player Save', `whitelists sync failed (${String(error.message).slice(0, 160)}); keeping the end-game save in the Player.Save.Data file`, 200);
+      }
+      await writePlayerSaveFile(player);
       recordAdminLog('info', 'Player Save', `End-game payload saved for inspection; received=${receivedFields.join(',') || '(none)'}; customization=${Object.keys(savedCustomization).join(',') || 'not present/recognized'}`, 200);
-      res.json({ success: true, status: 1, code: 0, data: { profile: playerSaveDocument(await whitelistRepository.findBySteamId(player.steamId)), message: 'result saved' }, error: null });
+      const endgameRow = await whitelistRepository.findBySteamId(player.steamId);
+      const endgameProfile = playerSaveDocument(endgameRow || {});
+      await applyPlayerSaveFile(endgameProfile, player.steamId);
+      res.json({ success: true, status: 1, code: 0, data: { profile: endgameProfile, message: 'result saved' }, error: null });
     });
   } catch (error) {
     console.error('[End Game Result]', error.message);
@@ -1677,13 +1833,23 @@ app.use(['/live', '/logapi'], (req, res) => {
         // builds post their save to an unmapped path, and discarding that only
         // copy is a common reason a player's Save Data stays empty.
         let applied = {};
+        let persistFailed = false;
         try { applied = await persistGameCustomization(player, rawBody); }
-        catch (error) { recordAdminLog('warn', 'Player Save', `Unmapped write rejected: ${String(error.message).slice(0, 160)}`, 400); }
-        if (Object.keys(applied).length) {
+        catch (error) {
+          const invalid = /must be|invalid|too large|character ID/i.test(error.message);
+          recordAdminLog('warn', 'Player Save', `Unmapped write rejected: ${String(error.message).slice(0, 160)}`, invalid ? 400 : 200);
+          // A persistence failure (for example a database missing the
+          // save_data columns) must not discard the game's payload: it is
+          // kept in the Player.Save.Data file and the request still succeeds.
+          persistFailed = !invalid;
+        }
+        if (Object.keys(applied).length || persistFailed) {
+          await writePlayerSaveFile(player);
           const row = whitelistRepository ? await whitelistRepository.findBySteamId(player.steamId) : null;
           const profile = playerSaveDocument(row || {});
+          await applyPlayerSaveFile(profile, player.steamId);
           profile.steamid = player.steamId;
-          recordAdminLog('info', 'Player Save', `Applied unmapped write ${req.method} ${path}; persisted=${Object.keys(applied).join(',')}`, 200);
+          recordAdminLog('info', 'Player Save', `Applied unmapped write ${req.method} ${path}; persisted=${Object.keys(applied).join(',') || 'Player.Save.Data file'}`, 200);
           res.set('Cache-Control', 'no-store').status(200).json({ status: 1, success: true, data: { profile }, error: null });
           return;
         }
