@@ -35,6 +35,11 @@ app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 const adminLogs = [];
+// Cache only successful Steam ticket validations. The raw ticket is never
+// retained; each request still checks the current whitelist/ban status.
+const verifiedSteamTickets = new Map();
+const STEAM_TICKET_CACHE_TTL_MS = 5 * 60 * 1000;
+const STEAM_TICKET_CACHE_MAX_ENTRIES = 1000;
 function recordAdminLog(level, source, message, status = null, game = null) {
   if (!game && /^(Game API|Game Client|Steam Auth|Game Error|Match Log|Matchmaking|Player Save)$/.test(source)) {
     game = { name: 'Home Sweet Home Online', client: 'server-side event' };
@@ -536,43 +541,58 @@ const handleSteamGameAuth = async (req, res) => {
     const webApiKey = String(process.env.STEAM_WEB_API_KEY || '').trim();
     const publisherKey = String(process.env.STEAM_PUBLISHER_KEY || '').trim();
     const steamApiKey = webApiKey || publisherKey;
-    // App ID 480 is used for this deployment's Steam tickets; allow override.
-    const appId = String(process.env.STEAM_APP_ID || '480').trim();
+    // HSHO Steam App ID. Render's STEAM_APP_ID environment variable overrides this.
+    const appId = String(process.env.STEAM_APP_ID || '2334220').trim();
     const defaultSteamHost = publisherKey && !webApiKey ? 'partner.steam-api.com' : 'api.steampowered.com';
     const steamHost = String(process.env.STEAM_API_HOST || defaultSteamHost).trim().toLowerCase();
-    if (!steamApiKey || !/^\d+$/.test(appId) || !['api.steampowered.com', 'partner.steam-api.com'].includes(steamHost)) { recordAdminLog('error', 'Steam Auth', 'Steam ticket validation environment is incomplete or invalid', 503); return gameError(res, 503, 'Steam ticket validation is not configured'); }
-    const steamUrl = new URL(`https://${steamHost}/ISteamUserAuth/AuthenticateUserTicket/v1/`);
-    steamUrl.searchParams.set('key', steamApiKey);
-    steamUrl.searchParams.set('appid', appId);
-    steamUrl.searchParams.set('ticket', ticket);
-    if (process.env.STEAM_TICKET_IDENTITY) steamUrl.searchParams.set('identity', process.env.STEAM_TICKET_IDENTITY);
-    const steamResponse = await fetch(steamUrl, { signal: AbortSignal.timeout(12000) });
-    const steamBody = await steamResponse.text();
-    const steamContentType = steamResponse.headers.get('content-type') || 'unknown';
-    if (!steamResponse.ok) {
-      // Do not log the request URL; it contains the private API key and ticket.
-      console.warn('[Steam Auth] Steam returned HTTP', steamResponse.status, 'content-type:', steamContentType);
-      recordAdminLog('error', 'Steam Auth', `Steam returned HTTP ${steamResponse.status} (${steamContentType})`, 502);
-      return gameError(res, 502, `Steam authentication service returned HTTP ${steamResponse.status}`);
+    const ticketHash = crypto.createHash('sha256').update(ticket, 'utf8').digest('hex');
+    const nowMs = Date.now();
+    for (const [key, cached] of verifiedSteamTickets) {
+      if (cached.expiresAt <= nowMs) verifiedSteamTickets.delete(key);
     }
-    let steamPayload;
-    try { steamPayload = JSON.parse(steamBody); }
-    catch {
-      console.warn('[Steam Auth] Steam returned non-JSON response; content-type:', steamContentType);
-      recordAdminLog('error', 'Steam Auth', `Steam returned non-JSON response (${steamContentType})`, 502);
-      return gameError(res, 502, 'Steam authentication service returned an invalid response');
-    }
-    const steamId = String(steamPayload?.response?.params?.steamid || '');
-    if (!/^\d{17}$/.test(steamId)) {
-      const steamParams = steamPayload?.response?.params && typeof steamPayload.response.params === 'object' ? steamPayload.response.params : {};
-      const steamError = steamPayload?.response?.error && typeof steamPayload.response.error === 'object' ? steamPayload.response.error : {};
-      const safeValue = value => String(value ?? 'unknown').replace(/[^a-zA-Z0-9_. -]/g, '').slice(0, 48) || 'unknown';
-      const result = safeValue(steamParams.result ?? steamParams.resultcode);
-      const errorCode = safeValue(steamError.errorcode ?? steamPayload?.error?.errorcode);
-      const errorDescription = safeValue(steamError.errordesc ?? steamError.error_description ?? steamPayload?.error?.errordesc);
-      const responseFields = Object.keys(steamParams).slice(0, 12).join(',') || '(none)';
-      recordAdminLog('warn', 'Steam Auth', `Steam rejected ticket; result=${result}; error_code=${errorCode}; error_desc=${errorDescription}; response_fields=${responseFields}`, 401);
-      return gameError(res, 401, 'Steam rejected the session ticket');
+    let steamId = verifiedSteamTickets.get(ticketHash)?.steamId || '';
+    if (steamId) {
+      recordAdminLog('info', 'Steam Auth', 'Reused prior successful Steam ticket validation');
+    } else {
+      if (!steamApiKey || !/^\d+$/.test(appId) || !['api.steampowered.com', 'partner.steam-api.com'].includes(steamHost)) { recordAdminLog('error', 'Steam Auth', 'Steam ticket validation environment is incomplete or invalid', 503); return gameError(res, 503, 'Steam ticket validation is not configured'); }
+      const steamUrl = new URL(`https://${steamHost}/ISteamUserAuth/AuthenticateUserTicket/v1/`);
+      steamUrl.searchParams.set('key', steamApiKey);
+      steamUrl.searchParams.set('appid', appId);
+      steamUrl.searchParams.set('ticket', ticket);
+      if (process.env.STEAM_TICKET_IDENTITY) steamUrl.searchParams.set('identity', process.env.STEAM_TICKET_IDENTITY);
+      const steamResponse = await fetch(steamUrl, { signal: AbortSignal.timeout(12000) });
+      const steamBody = await steamResponse.text();
+      const steamContentType = steamResponse.headers.get('content-type') || 'unknown';
+      if (!steamResponse.ok) {
+        // Do not log the request URL; it contains the private API key and ticket.
+        console.warn('[Steam Auth] Steam returned HTTP', steamResponse.status, 'content-type:', steamContentType);
+        recordAdminLog('error', 'Steam Auth', `Steam returned HTTP ${steamResponse.status} (${steamContentType})`, 502);
+        return gameError(res, 502, `Steam authentication service returned HTTP ${steamResponse.status}`);
+      }
+      let steamPayload;
+      try { steamPayload = JSON.parse(steamBody); }
+      catch {
+        console.warn('[Steam Auth] Steam returned non-JSON response; content-type:', steamContentType);
+        recordAdminLog('error', 'Steam Auth', `Steam returned non-JSON response (${steamContentType})`, 502);
+        return gameError(res, 502, 'Steam authentication service returned an invalid response');
+      }
+      steamId = String(steamPayload?.response?.params?.steamid || '');
+      if (!/^\d{17}$/.test(steamId)) {
+        const steamParams = steamPayload?.response?.params && typeof steamPayload.response.params === 'object' ? steamPayload.response.params : {};
+        const steamError = steamPayload?.response?.error && typeof steamPayload.response.error === 'object' ? steamPayload.response.error : {};
+        const safeValue = value => String(value ?? 'unknown').replace(/[^a-zA-Z0-9_. -]/g, '').slice(0, 48) || 'unknown';
+        const result = safeValue(steamParams.result ?? steamParams.resultcode);
+        const errorCode = safeValue(steamError.errorcode ?? steamPayload?.error?.errorcode);
+        const errorDescription = safeValue(steamError.errordesc ?? steamError.error_description ?? steamPayload?.error?.errordesc);
+        const responseFields = Object.keys(steamParams).slice(0, 12).join(',') || '(none)';
+        recordAdminLog('warn', 'Steam Auth', `Steam rejected ticket for appid=${appId}; result=${result}; error_code=${errorCode}; error_desc=${errorDescription}; response_fields=${responseFields}`, 401);
+        return gameError(res, 401, 'Steam rejected the session ticket');
+      }
+      if (verifiedSteamTickets.size >= STEAM_TICKET_CACHE_MAX_ENTRIES) {
+        const oldestKey = verifiedSteamTickets.keys().next().value;
+        if (oldestKey) verifiedSteamTickets.delete(oldestKey);
+      }
+      verifiedSteamTickets.set(ticketHash, { steamId, expiresAt: nowMs + STEAM_TICKET_CACHE_TTL_MS });
     }
 
     const row = await whitelistRepository.findBySteamId(steamId);
