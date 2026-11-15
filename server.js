@@ -541,8 +541,8 @@ const handleSteamGameAuth = async (req, res) => {
     const webApiKey = String(process.env.STEAM_WEB_API_KEY || '').trim();
     const publisherKey = String(process.env.STEAM_PUBLISHER_KEY || '').trim();
     const steamApiKey = webApiKey || publisherKey;
-    // HSHO Steam App ID. Render's STEAM_APP_ID environment variable overrides this.
-    const appId = String(process.env.STEAM_APP_ID || '2334220').trim();
+    // This HSHO deployment issues Steam tickets for App ID 480.
+    const appId = String(process.env.STEAM_APP_ID || '480').trim();
     const defaultSteamHost = publisherKey && !webApiKey ? 'partner.steam-api.com' : 'api.steampowered.com';
     const steamHost = String(process.env.STEAM_API_HOST || defaultSteamHost).trim().toLowerCase();
     const ticketHash = crypto.createHash('sha256').update(ticket, 'utf8').digest('hex');
